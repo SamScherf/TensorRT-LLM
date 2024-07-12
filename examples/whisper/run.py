@@ -287,10 +287,6 @@ class WhisperTRTLLM(object):
             text = self.tokenizer.decode(output_ids_dict[key][0]).strip()
             texts_dict[key] = text
 
-        # for i in range(len(output_ids)):
-        #     text = self.tokenizer.decode(output_ids[i][0]).strip()
-        #     texts.append(text)
-
         return texts_dict
 
 
@@ -358,14 +354,13 @@ def decode_dataset(
                              pin_memory=True,
                              collate_fn=collate_wrapper)
 
-    # Loop through the batches and run the encoder on each then add to large list
+    # Loop through the all batches and run the encoder on each wav file
     total_duration = 0
-
-    texts_all = list()
-    ids_all = list()
-    encoder_output_list = list()
+    labels = list()
+    wav_ids = list()
+    encoder_outputs = list()
     for batch in data_loader:
-        waveforms, durations, texts, ids = batch
+        waveforms, durations, batch_texts, batch_ids = batch
         total_duration += sum(durations) / sample_rate
 
         for wave in waveforms:
@@ -380,21 +375,24 @@ def decode_dataset(
         ]
         features = torch.cat(features, dim=0).type(str_dtype_to_torch(dtype))
 
-        encoder_ouput = model.encoder.get_audio_features(features)
+        batch_encoder_output = model.encoder.get_audio_features(features)
 
-        ids_all += ids
-        texts_all += texts
-        encoder_output_list.append(encoder_ouput)
+        wav_ids += batch_ids
+        labels += batch_texts
+        encoder_outputs.append(batch_encoder_output)
 
-    encoder_output_tensor = torch.cat(encoder_output_list, dim=0)
-    predictions_dict = model.process_encoder_output(encoder_output_tensor, text_prefix=text_prefix,
-                                               num_beams=num_beams, batch_size=batch_size)
+    # Recast encoder outputs to be a tensor
+    encoder_outputs = torch.cat(encoder_outputs, dim=0)
 
+    # Process all the encoder outputs
+    predictions_dict = model.process_encoder_output(encoder_outputs, text_prefix=text_prefix,
+                                                    num_beams=num_beams, batch_size=batch_size)
+
+    # Loop through the predictions
     results = list()
-    # for wav_id, label, prediction in zip(ids_all, texts_all, predictions):
     for index in predictions_dict.keys():
-        wav_id = ids_all[index]
-        label = texts_all[index]
+        wav_id = wav_ids[index]
+        label = labels[index]
         prediction = predictions_dict[index]
 
         # remove all special tokens in the prediction
