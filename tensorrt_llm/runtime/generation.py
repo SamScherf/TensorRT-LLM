@@ -3135,21 +3135,11 @@ class GenerationSession(object):
                         # Update mapping
                         mapping[i] = key
 
-                        # Update decoder
-                        model_inputs = self._prepare_context_inputs(
-                            batch_size=batch_size,
-                            context_lengths=context_lengths,
-                            host_context_lengths=host_context_lengths,
-                            use_gpt_attention_plugin=self.use_gpt_attention_plugin,
-                            remove_input_padding=self.remove_input_padding,
-                            max_context_length=max_context_length,
-                            input_ids=input_ids,
-                            pad_id=scfg.pad_id,
-                            eos_id=scfg.end_id)
-
-                        position_ids = model_inputs.get('position_ids', None)
-                        last_token_ids = model_inputs.get('last_token_ids')
-                        attention_mask = model_inputs.get('attention_mask', None)
+                        # I'm unsure why exactly all of the rest of the code under this section
+                        # is required. I believe it has something to do with "updating" the encoder
+                        # to use the newly set encoder_outputs and input_ids. I suspect lots
+                        # of unnecessarily overhead is coming from this section
+                        # -----------------------------------------------------------------------
 
                         if step % 2:
                             context = self.runtime.context_0
@@ -3162,16 +3152,56 @@ class GenerationSession(object):
                             this_tgt_cache_indirection = cache_indirections[1]
                             next_src_cache_indirection = cache_indirections[1]
 
-                        ctx_tensors = self._get_context_shape_buffer(
-                            input_ids, context_lengths, host_context_lengths, position_ids,
-                            last_token_ids, attention_mask, cross_attention_mask,
-                            this_src_cache_indirection, kv_cache_block_offsets,
-                            host_kv_cache_block_offsets, cross_kv_cache_block_offsets,
-                            host_cross_kv_cache_block_offsets, hidden_states,
-                            prompt_embedding_table, tasks, prompt_vocab_size,
-                            encoder_outputs, encoder_input_lengths)
+                        ctx_tensors = {}
+
+                        def sym(x, name):
+                            return RuntimeTensor.from_torch(name, x)
+
+                        def add_tensor(x, name):
+                            return ctx_tensors.update({name: sym(x, name)})
+
+                        add_tensor(encoder_outputs, 'encoder_output')
+
+                        if self.mapping.has_pp():
+                            hidden_size = self.hidden_size * self.mapping.tp_size
+                            if input_ids.dim() == 2:
+                                hidden_states_input = hidden_states_input.resize_(
+                                    batch_size, input_ids.shape[1], hidden_size)
+                            else:
+                                hidden_states_input = hidden_states_input.resize_(
+                                    batch_size, hidden_size)
+
+                        if self.mapping.is_last_pp_rank():
+                            add_tensor(self.buffer['logits'], 'logits')
+                        else:
+                            add_tensor(hidden_states_input, 'hidden_states_output')
+                        
+                        if self.mapping.is_first_pp_rank():
+                            add_tensor(input_ids, 'input_ids')
+                        else:
+                            add_tensor(hidden_states_input, 'hidden_states_input')
+
+                        batch_size = context_lengths.shape[0]
+                        if not self.paged_kv_cache:
+                            for idx in range(self.first_layer, self.last_layer):
+                                if self.layer_types[idx] == 'attention':
+                                    key_value_cache = self.buffer[f'present_key_value_{idx}']
+                                    # when plugin is used, past_ket_value tensor does not need to be empty tensor
+                                    # because plugin does not care, and does not use this shape.
+                                    add_tensor(key_value_cache, f'past_key_value_{idx}')
+                                    add_tensor(key_value_cache, f'present_key_value_{idx}')
+
+                                    if self.cross_attention:
+                                        cross_cache_buffer = self.buffer[
+                                            f'cross_present_key_value_{idx}']
+                                        add_tensor(cross_cache_buffer,
+                                                   f'cross_past_key_value_{idx}')
+                                        add_tensor(cross_cache_buffer,
+                                                   f'cross_present_key_value_{idx}')
+
                         context = self.runtime.ctx_context
                         self.runtime._set_tensors(context, ctx_tensors)
+                        # -----------------------------------------------------------------------
 
                         update = True
 
