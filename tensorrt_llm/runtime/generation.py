@@ -18,6 +18,7 @@ import csv
 import math
 import os
 import platform
+import queue
 from dataclasses import dataclass, field
 from functools import reduce, wraps
 from pathlib import Path
@@ -1017,10 +1018,11 @@ class GenerationSession(object):
 
     def __setup_decoder(self, input_ids: torch.Tensor,
                         sampling_config: SamplingConfig,
-                        host_context_lengths: torch.Tensor):
+                        host_context_lengths: torch.Tensor,
+                        batch_size: int):
         '''Allocate buffers and setup the post-processing decoder kernel
         '''
-        batch_size = host_context_lengths.shape[0]
+        # batch_size = host_context_lengths.shape[0]
         scfg = sampling_config  # just to make a shorter name, no other meaning
         if isinstance(scfg.top_k, torch.Tensor):
             assert scfg.top_k.dtype == torch.int32, f"scfg.top_k.dtype ({scfg.top_k.dtype}) must be torch.int32"
@@ -1193,7 +1195,8 @@ class GenerationSession(object):
             self.output_ids = torch.cat(
                 (padded_input_ids,
                  torch.full(
-                     (batch_size, self.max_seq_length - max_context_length),
+                     # (batch_size, self.max_seq_length - max_context_length),
+                     (padded_input_ids.shape[0], self.max_seq_length - max_context_length),
                      scfg.end_id,
                      dtype=padded_input_ids.dtype,
                      device=padded_input_ids.device)),
@@ -1380,7 +1383,8 @@ class GenerationSession(object):
         self.batch_size = batch_size
         self.max_context_length = max_context_length
         self.max_new_tokens = max_new_tokens
-        self.max_seq_length = max_context_length + max_new_tokens
+        self.max_seq_length = 80
+        # self.max_seq_length = max_context_length + max_new_tokens
         if medusa_choices is not None:
             self.max_seq_length += self._model_config.max_medusa_tokens
         self.beam_width = beam_width
@@ -1714,10 +1718,10 @@ class GenerationSession(object):
             hidden_size = self.hidden_size * self.mapping.tp_size
             if input_ids.dim() == 2:
                 hidden_states_input = hidden_states_input.resize_(
-                    input_ids.shape[0], input_ids.shape[1], hidden_size)
+                    batch_size, input_ids.shape[1], hidden_size)
             else:
                 hidden_states_input = hidden_states_input.resize_(
-                    input_ids.shape[0], hidden_size)
+                    batch_size, hidden_size)
 
         if self.mapping.is_last_pp_rank():
             add_tensor(self.buffer['logits'], 'logits')
@@ -2005,6 +2009,7 @@ class GenerationSession(object):
                 # a must-have input. We just use the encoder_output
                 encoder_output_shape = encoder_output.shape
 
+            # ATTENTION
             # in generation phase, cross kv cache is already filled during context phase, set to False
             add_tensor(torch.zeros(1, dtype=torch.bool, device=self.device),
                        'cross_kv_cache_gen')
@@ -2631,7 +2636,8 @@ class GenerationSession(object):
             bad_words_data, no_repeat_ngram_size, encoder_output: torch.Tensor,
             encoder_input_lengths: torch.Tensor,
             stopping_criteria: StoppingCriteria,
-            logits_processor: LogitsProcessor, **kwargs):
+            logits_processor: LogitsProcessor, 
+            update: bool, **kwargs):
         if step % 2:
             context = self.runtime.context_0
             this_src_cache_indirection = cache_indirections[1]
@@ -2643,7 +2649,8 @@ class GenerationSession(object):
             this_tgt_cache_indirection = cache_indirections[1]
             next_src_cache_indirection = cache_indirections[1]
 
-        if step == 0:
+        # if step == 0:
+        if update:
             model_inputs = self._prepare_context_inputs(
                 batch_size=batch_size,
                 context_lengths=context_lengths,
@@ -2668,7 +2675,6 @@ class GenerationSession(object):
                         beam_width=1)
                     cross_kv_cache_block_offsets = host_cross_kv_cache_block_offsets.to(
                         'cuda')
-
             ctx_tensors = self._get_context_shape_buffer(
                 input_ids, context_lengths, host_context_lengths, position_ids,
                 last_token_ids, attention_mask, cross_attention_mask,
@@ -3043,9 +3049,51 @@ class GenerationSession(object):
                                                     step_count)
 
         next_step_tensors = None
-        for step in range(0, self.max_new_tokens):
 
-            should_stop, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
+        # Create queue of encoder_output and input_ids
+        # This should really be one queue
+        encoder_output_queue = queue.Queue()
+        for i in range(encoder_output.size(0)):
+            encoder_output_queue.put((i, encoder_output[i, :, :]))
+
+        input_ids_queue = queue.Queue()
+        for i in range(input_ids.size(0)):
+            input_ids_queue.put((i, input_ids[i, :]))
+
+        # Create mapping from index on encoder to key (which is the original index)
+        mapping = dict()
+
+        # Set initial encoder_output and input_ids
+        encoder_output_list = list()
+        input_ids_list = list()
+        for i in range(batch_size):
+            # Pull from queue
+            encoder_output_key, single_encoder_output = encoder_output_queue.get()
+            input_ids_key, single_input_ids = input_ids_queue.get()
+
+            # Add to active list
+            encoder_output_list.append(single_encoder_output)
+            input_ids_list.append(single_input_ids)
+
+            # Update mapping
+            # This is a tmp hack since appending maintains order
+            mapping[i] = encoder_output_key
+
+        encoder_output = torch.stack(encoder_output_list, dim=0)
+        input_ids = torch.stack(input_ids_list, dim=0)
+
+        # Create results dict
+        results = dict()
+
+        first = True
+        update = True
+        saved = None
+        for step in range(0, self.max_new_tokens):
+            # print("step: " + str(step))
+
+            import time
+            start = time.time()
+            seqs_status, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
                 kv_cache_block_offsets, host_kv_cache_block_offsets,
@@ -3055,8 +3103,9 @@ class GenerationSession(object):
                 prompt_vocab_size, ite, sequence_limit_lengths,
                 sequence_lengths, next_step_tensors, stop_words_data,
                 bad_words_data, no_repeat_ngram_size, encoder_output,
-                encoder_input_lengths, stopping_criteria, logits_processor,
+                encoder_input_lengths, stopping_criteria, logits_processor, update,
                 **kwargs)
+            # print(time.time()-start)
             if step == 0:
                 if benchmark_profiler is not None:
                     benchmark_profiler.record_cuda_event('first_token')
@@ -3069,33 +3118,141 @@ class GenerationSession(object):
                 if self.gather_generation_logits:
                     outputs_generation_logits.append(generation_logits)
 
-            if should_stop is not None and should_stop.item():
-                profile_fn(benchmark_profiler, generation_phase_step_count)
-                if self.is_medusa_mode:
-                    # just hack away for now
-                    final_output_ids = self.output_ids.clone().unsqueeze(1)
-                    final_output_ids = final_output_ids[:, :, :self.
-                                                        max_seq_length -
-                                                        self._model_config.
-                                                        max_medusa_tokens]
-                else:
-                    final_output_ids = self.finalize_decoder(
-                        context_lengths, batch_size, beam_width, scfg)
 
-                if self.mapping.is_first_pp_rank():
-                    if return_dict:
-                        return get_outputs_dict(final_output_ids)
-                    else:
-                        return final_output_ids
-                elif self.mapping.is_last_pp_rank():
-                    outputs = {}
-                    if self.gather_context_logits:
-                        outputs['context_logits'] = outputs_context_logits
-                    if self.gather_generation_logits:
-                        outputs['generation_logits'] = outputs_generation_logits
-                    return outputs
-                else:
-                    return None
+            if update == True:
+                update = False
+
+            if seqs_status is not None:
+                for i in range(seqs_status.shape[0]):
+                    if seqs_status[i] and not encoder_output_queue.empty():
+                        # Get output ids
+                        final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
+
+                        # Save finished sequence
+                        results[mapping[i]] = final_output_ids[i]
+
+                        # Pop off queue
+                        encoder_output_key, single_encoder_output = encoder_output_queue.get()
+                        input_ids_key, single_input_ids = input_ids_queue.get()
+
+                        # Put new sequence on gpu
+                        encoder_output[i] = single_encoder_output
+                        input_ids[i] = single_input_ids
+
+                        # Update mapping
+                        mapping[i] = encoder_output_key
+
+                        model_inputs = self._prepare_context_inputs(
+                            batch_size=batch_size,
+                            context_lengths=context_lengths,
+                            host_context_lengths=host_context_lengths,
+                            use_gpt_attention_plugin=self.use_gpt_attention_plugin,
+                            remove_input_padding=self.remove_input_padding,
+                            max_context_length=max_context_length,
+                            input_ids=input_ids,
+                            pad_id=scfg.pad_id,
+                            eos_id=scfg.end_id)
+
+                        position_ids = model_inputs.get('position_ids', None)
+                        last_token_ids = model_inputs.get('last_token_ids')
+                        attention_mask = model_inputs.get('attention_mask', None)
+
+                        if step % 2:
+                            context = self.runtime.context_0
+                            this_src_cache_indirection = cache_indirections[1]
+                            this_tgt_cache_indirection = cache_indirections[0]
+                            next_src_cache_indirection = cache_indirections[0]
+                        else:
+                            context = self.runtime.context_1
+                            this_src_cache_indirection = cache_indirections[0]
+                            this_tgt_cache_indirection = cache_indirections[1]
+                            next_src_cache_indirection = cache_indirections[1]
+
+                        ctx_tensors = self._get_context_shape_buffer(
+                            input_ids, context_lengths, host_context_lengths, position_ids,
+                            last_token_ids, attention_mask, cross_attention_mask,
+                            this_src_cache_indirection, kv_cache_block_offsets,
+                            host_kv_cache_block_offsets, cross_kv_cache_block_offsets,
+                            host_cross_kv_cache_block_offsets, hidden_states,
+                            prompt_embedding_table, tasks, prompt_vocab_size,
+                            encoder_output, encoder_input_lengths)
+                        context = self.runtime.ctx_context
+                        self.runtime._set_tensors(context, ctx_tensors)
+                        update = True
+                        # print("changed made")
+
+                    if update:
+                        # Update decoder
+                        self.__setup_decoder(input_ids, scfg, host_context_lengths, batch_size)
+                        continue
+
+                # Check if all done
+                for i in range(seqs_status.shape[0]):
+                    if not seqs_status[i]:
+                        break
+
+                    if encoder_output_queue.empty():
+                        final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
+                        for i in range(batch_size):
+                            results[mapping[i]] = final_output_ids[i]
+                        return results
+
+            if step == self.max_new_tokens-1:
+
+                # Get output ids
+                final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
+
+                # Update results
+                for i in range(batch_size):
+                    results[mapping[i]] = final_output_ids[i]
+
+
+                return results
+
+            # final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
+            # if (should_stop is not None and should_stop.item()) or step == self.max_new_tokens-1:
+            #     if first:
+            #         encoder_output = encoder_output_backup[batch_size:batch_size*2]
+            #         input_ids = input_ids_backup[batch_size:batch_size*2]
+
+            #         first = False
+            #         update = True
+            #         saved = final_output_ids
+
+            #         self.__setup_decoder(input_ids, scfg, host_context_lengths, batch_size)
+            #         continue
+
+            #     else:
+            #         return torch.cat((saved, final_output_ids), dim=0)
+
+
+            # if should_stop is not None and should_stop.item():
+            #     profile_fn(benchmark_profiler, generation_phase_step_count)
+            #     if self.is_medusa_mode:
+            #         # just hack away for now
+            #         final_output_ids = self.output_ids.clone().unsqueeze(1)
+            #         final_output_ids = final_output_ids[:, :, :self.
+            #                                             max_seq_length -
+            #                                             self._model_config.
+            #                                             max_medusa_tokens]
+            #     else:
+            #         final_output_ids = self.finalize_decoder(
+            #             context_lengths, batch_size, beam_width, scfg)
+
+            #     if self.mapping.is_first_pp_rank():
+            #         if return_dict:
+            #             return get_outputs_dict(final_output_ids)
+            #         else:
+            #             return final_output_ids
+            #     elif self.mapping.is_last_pp_rank():
+            #         outputs = {}
+            #         if self.gather_context_logits:
+            #             outputs['context_logits'] = outputs_context_logits
+            #         if self.gather_generation_logits:
+            #             outputs['generation_logits'] = outputs_generation_logits
+            #         return outputs
+            #     else:
+            #         return None
 
         assert not self.is_medusa_mode, "the custom decoder doesn't support medusa."
 
@@ -3241,9 +3398,13 @@ class GenerationSession(object):
                stopping_criteria: StoppingCriteria = None,
                logits_processor: LogitsProcessor = None,
                cross_attention_mask: torch.Tensor = None,
+               batch_size = None,
                **kwargs):
+
+        if batch_size == None:
+            batch_size = context_lengths.size(0)
+
         scfg = sampling_config
-        batch_size = context_lengths.size(0)
         beam_width = scfg.num_beams
         max_context_length = torch.max(context_lengths).item()
         host_context_lengths = context_lengths.cpu()
@@ -3266,7 +3427,7 @@ class GenerationSession(object):
                 0] == 1, "Packed 2D input must have shape [1, <sum of input lengths>]"
             input_ids = input_ids.squeeze(0)
 
-        self.__setup_decoder(input_ids, scfg, host_context_lengths)
+        self.__setup_decoder(input_ids, scfg, host_context_lengths, batch_size)
         if not self.buffer_allocated:
             raise RuntimeError('Buffer not allocated, please call setup first!')
 
@@ -3425,6 +3586,7 @@ class GenerationSession(object):
                           max_bad_words_len)
 
         # start context phase
+
         if streaming:
             return self.decode_stream(
                 batch_size, scfg, sequence_lengths, context_lengths,
