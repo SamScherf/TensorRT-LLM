@@ -15,6 +15,7 @@ import tensorrt as trt
 
 from huggingface_hub import hf_hub_download
 from PIL import Image
+from safetensors import safe_open
 from torchvision import transforms
 from transformers import (AutoConfig, AutoProcessor, AutoTokenizer,
                           Blip2Processor, CLIPImageProcessor, NougatProcessor,
@@ -94,6 +95,130 @@ def trt_dtype_to_torch(dtype):
         raise TypeError("%s is not supported" % dtype)
 
 
+class LlavaNextUtils:
+    # https://github.com/haotian-liu/LLaVA/blob/main/llava/mm_utils.py
+
+    @staticmethod
+    def select_best_resolution(original_size, possible_resolutions):
+        """
+            Selects the best resolution from a list of possible resolutions based on the original size.
+
+            Args:
+                original_size (tuple): The original size of the image in the format (width, height).
+                possible_resolutions (list): A list of possible resolutions in the format [(width1, height1), (width2, height2), ...].
+
+            Returns:
+                tuple: The best fit resolution in the format (width, height).
+            """
+        original_width, original_height = original_size
+        best_fit = None
+        max_effective_resolution = 0
+        min_wasted_resolution = float('inf')
+
+        for width, height in possible_resolutions:
+            scale = min(width / original_width, height / original_height)
+            downscaled_width, downscaled_height = int(
+                original_width * scale), int(original_height * scale)
+            effective_resolution = min(downscaled_width * downscaled_height,
+                                       original_width * original_height)
+            wasted_resolution = (width * height) - effective_resolution
+
+            if effective_resolution > max_effective_resolution or (
+                    effective_resolution == max_effective_resolution
+                    and wasted_resolution < min_wasted_resolution):
+                max_effective_resolution = effective_resolution
+                min_wasted_resolution = wasted_resolution
+                best_fit = (width, height)
+
+        return best_fit
+
+    @staticmethod
+    def get_anyres_image_grid_shape(image_size, patch_size):
+        """
+            Calculate the shape of the image patch grid after the preprocessing for images of any resolution.
+
+            Args:
+                image_size (tuple): The size of the input image in the format (width, height).
+                patch_size (int): The size of each image patch.
+
+            Returns:
+                tuple: The shape of the image patch grid in the format (width, height).
+            """
+        IMAGE_GRID_PINPOINTS = [[336, 672], [672, 336], [672, 672], [1008, 336],
+                                [336, 1008]]
+        width, height = LlavaNextUtils.select_best_resolution(
+            image_size, IMAGE_GRID_PINPOINTS)
+        return width // patch_size, height // patch_size
+
+    @staticmethod
+    def unpad_image(tensor, original_size):
+        """
+            Unpads a PyTorch tensor of a padded and resized image.
+
+            Args:
+            tensor (torch.Tensor): The image tensor, assumed to be in CxHxW format.
+            original_size (tuple): The original size of the image (width, height).
+
+            Returns:
+            torch.Tensor: The unpadded image tensor.
+            """
+        original_width, original_height = original_size
+        current_height, current_width = tensor.shape[1:]
+
+        original_aspect_ratio = original_width / original_height
+        current_aspect_ratio = current_width / current_height
+
+        if original_aspect_ratio > current_aspect_ratio:
+            scale_factor = current_width / original_width
+            new_height = int(original_height * scale_factor)
+            padding = (current_height - new_height) // 2
+            unpadded_tensor = tensor[:, padding:current_height - padding, :]
+        else:
+            scale_factor = current_height / original_height
+            new_width = int(original_width * scale_factor)
+            padding = (current_width - new_width) // 2
+            unpadded_tensor = tensor[:, :, padding:current_width - padding]
+
+        return unpadded_tensor
+
+    @staticmethod
+    def rearrange_image_features(image_feature, image_newline, image_size):
+        """
+            Combine PyTorch feature grids from image patches.
+
+            Args:
+            image_feature (torch.Tensor): The feature grids, assumed to be in NxCxHxW format.
+            image_newline (torch.Tensor): The newline embedding.
+            image_size (tuple): Size of the original image (width, height).
+            """
+        CLIP_IMAGE_SIZE = 336
+        CLIP_PATCH_SIZE = 14
+        NUM_PATCHES_PER_SIDE = CLIP_IMAGE_SIZE // CLIP_PATCH_SIZE
+        if image_feature.shape[0] == 1:
+            return torch.cat((image_feature, image_newline[None]), dim=0)
+
+        base_image_feature = image_feature[0]
+        image_feature = image_feature[1:]
+        height = width = NUM_PATCHES_PER_SIDE
+        assert height * width == base_image_feature.shape[0]
+
+        num_patch_width, num_patch_height = LlavaNextUtils.get_anyres_image_grid_shape(
+            image_size, CLIP_IMAGE_SIZE)
+        image_feature = image_feature.view(num_patch_height, num_patch_width,
+                                           height, width, -1)
+
+        image_feature = image_feature.permute(4, 0, 2, 1, 3).contiguous()
+        image_feature = image_feature.flatten(1, 2).flatten(2, 3)
+        image_feature = LlavaNextUtils.unpad_image(image_feature, image_size)
+        image_feature = torch.cat(
+            (image_feature, image_newline[:, None, None].expand(
+                *image_feature.shape[:-1], 1)),
+            dim=-1)
+        image_feature = image_feature.flatten(1, 2).transpose(0, 1)
+        image_feature = torch.cat((base_image_feature, image_feature), dim=0)
+        return image_feature
+
+
 class MultimodalModelRunner:
 
     def __init__(self, args):
@@ -122,7 +247,9 @@ class MultimodalModelRunner:
 
         if self.model_type == 'video-neva':
             self.num_frames = config['builder_config'].get('num_frames', None)
-
+        if self.model_type == "llava_next":
+            self.llm_name = AutoConfig.from_pretrained(
+                args.hf_model_dir).text_config._name_or_path
         self.profiling_iterations = 20
 
         self.init_image_encoder()
@@ -179,8 +306,9 @@ class MultimodalModelRunner:
                 use_fast=False,
                 use_legacy=False)
         else:
+            use_fast = False if self.model_type != "phi-3-vision" else True
             self.tokenizer = AutoTokenizer.from_pretrained(
-                self.args.hf_model_dir, use_fast=False, use_legacy=False)
+                self.args.hf_model_dir, use_fast=use_fast, use_legacy=False)
 
         self.tokenizer.padding_side = "right"
 
@@ -193,6 +321,22 @@ class MultimodalModelRunner:
         logger.info(f'Creating session from engine {vision_encoder_path}')
         self.visual_encoder_session = Session.from_serialized_engine(
             engine_buffer)
+        if self.model_type == "phi-3-vision":
+            self.image_newlines = {}
+            image_newlines_path = os.path.join(self.args.visual_engine_dir,
+                                               'image_newlines.safetensors')
+            with safe_open(image_newlines_path, framework="pt",
+                           device="cuda") as f:
+                for k in f.keys():
+                    self.image_newlines[k] = f.get_tensor(k)
+        if self.model_type == "llava_next":
+            self.image_newlines = {}
+            image_newlines_path = os.path.join(self.args.visual_engine_dir,
+                                               'image_newline.safetensors')
+            with safe_open(image_newlines_path, framework="pt",
+                           device="cuda") as f:
+                for k in f.keys():
+                    self.image_newlines[k] = f.get_tensor(k)
 
     def init_llm(self):
         if self.decoder_llm:
@@ -261,6 +405,17 @@ class MultimodalModelRunner:
             input_ids = input_ids.expand(self.args.batch_size,
                                          *input_ids.shape[1:])
             length = input_ids.shape[1]
+        elif self.model_type == 'phi-3-vision':
+            input = image
+            image = input['pixel_values']
+            bs = image.shape[0]
+            image = image.flatten(0, 1)
+        elif self.model_type == 'llava_next':
+            input = image
+            image = input['pixel_values']
+            bs = image.shape[0]
+            image = image[0]
+            image_size = input['image_sizes'][0].cpu()
 
         if not warmup:
             profiler.start("Vision")
@@ -310,6 +465,54 @@ class MultimodalModelRunner:
                 args.batch_size, visual_features, first_batch_split_prompts,
                 input_lengths)
             return input_ids, input_lengths, ptuning_args, visual_features
+        elif self.model_type == 'phi-3-vision':
+            input_ids = input["input_ids"].clone()
+            glb_GN = torch.squeeze(self.image_newlines["glb_GN"].clone(), dim=0)
+            sub_GN = self.image_newlines["sub_GN"].clone()
+
+            H = visual_features.shape[1]
+            C = visual_features.shape[-1]
+            #bs*17*12*12*3072
+            visual_features = visual_features.view(bs, -1, H, H, C)
+            global_img_feature = visual_features[:, 0]  #bs*12*12*3072
+            temp_glb_GN = sub_GN.repeat(bs, H, 1, 1)  #bs*12*1*3072
+            global_img_feature = torch.cat([global_img_feature, temp_glb_GN],
+                                           dim=2).reshape(bs, -1, C)
+
+            crop_visual_features = visual_features[:, 1:]
+            patch_sizes = [
+                image_size // image.shape[-1]
+                for image_size in input["image_sizes"]
+            ]
+            visual_features = []
+            for global_img_feature, crop_visual_feature, patch_size in zip(
+                    global_img_feature, crop_visual_features, patch_sizes):
+                crop_visual_feature = \
+                    crop_visual_feature[:patch_size[0]*patch_size[1]].view(patch_size[0], patch_size[1], H, H, C).permute(0, 2, 1, 3, 4).reshape(patch_size[0]*H, patch_size[1]*H, C)
+                temp_sub_GN = torch.squeeze(sub_GN.repeat(
+                    1, patch_size[0] * H, 1, 1),
+                                            dim=0)
+                crop_visual_feature = torch.cat(
+                    [crop_visual_feature, temp_sub_GN], dim=1).reshape(-1, C)
+                visual_features.append(
+                    torch.cat([crop_visual_feature, glb_GN, global_img_feature],
+                              dim=0))
+
+            num_img_tokens = [elem.size(0) for elem in visual_features]
+
+            visual_features = torch.cat(visual_features, dim=0)
+            input_ids = input_ids.expand(self.args.batch_size,
+                                         *input_ids.shape[1:])
+            input_ids = self.ptuning_setup_phi3(visual_features, input_ids,
+                                                num_img_tokens)
+            length = input_ids.shape[1]
+        elif self.model_type == 'llava_next':
+            visual_features = LlavaNextUtils.rearrange_image_features(
+                visual_features, self.image_newlines["image_newline"],
+                image_size)
+            input_ids = self.ptuning_setup_llava_next(visual_features,
+                                                      pre_prompt, post_prompt)
+            length = input_ids.shape[1]
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -331,7 +534,9 @@ class MultimodalModelRunner:
         input_lengths = torch.IntTensor([length] * args.batch_size).to(
             torch.int32)
 
-        if self.model_type in ['fuyu', 'kosmos-2']:
+        if self.model_type in [
+                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next'
+        ]:
             return input_ids, input_lengths, [visual_features], visual_features
 
         input_ids, ptuning_args = self.setup_fake_prompts(
@@ -611,6 +816,33 @@ class MultimodalModelRunner:
             res_input_ids.append(cur_input_ids)
         return res_input_ids
 
+    def ptuning_setup_llava_next(self, visual_features, pre_prompt,
+                                 post_prompt):
+        input_ids = []
+        fake_prompt_ids = list(
+            range(self.model_config.vocab_size,
+                  self.model_config.vocab_size + visual_features.shape[0]))
+        input_ids = self.tokenizer.encode(
+            pre_prompt[0]) + fake_prompt_ids + self.tokenizer.encode(
+                post_prompt[0])[self.tokenizer.add_bos_token:]
+        input_ids = [input_ids] * len(pre_prompt)
+        input_ids = torch.tensor(input_ids)
+        return input_ids
+
+    def ptuning_setup_phi3(self, visual_features, input_ids, num_img_tokens):
+        fake_prompt_id = torch.arange(
+            self.model_config.vocab_size,
+            self.model_config.vocab_size + visual_features.shape[0])
+        MAX_INPUT_ID = int(1e9)
+        positions = torch.nonzero((input_ids < 0) & (input_ids > -MAX_INPUT_ID),
+                                  as_tuple=False)
+        idx = 0
+        for i, cnt in enumerate(num_img_tokens):
+            input_ids[positions[idx, 0], positions[idx, 1]:positions[idx, 1] +
+                      cnt] = fake_prompt_id[idx:idx + cnt]
+            idx += cnt
+        return input_ids
+
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
         hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
         if prompt_table is not None:
@@ -690,16 +922,22 @@ class MultimodalModelRunner:
         elif "video-neva" in self.model_type:
             image = args.video_path
         else:
-            img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
-            image = Image.open(requests.get(img_url,
-                                            stream=True).raw).convert('RGB')
+            img_url = args.image_path
+            if img_url is None:
+                img_url = 'https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png'
+
+            if img_url.startswith("http") or img_url.startswith("https"):
+                image = Image.open(requests.get(img_url,
+                                                stream=True).raw).convert('RGB')
+            else:
+                image = Image.open(img_url).convert("RGB")
 
         return image
 
     def setup_inputs(self, input_text, raw_image):
         attention_mask = None
         if 'blip2' in self.model_type:
-            processor = Blip2Processor.from_pretrained(self.model_type)
+            processor = Blip2Processor.from_pretrained(self.args.hf_model_dir)
             image = processor(raw_image, input_text,
                               return_tensors="pt")['pixel_values']
 
@@ -735,6 +973,17 @@ class MultimodalModelRunner:
                 input_text = " [INST] which city is this? [/INST] "
             pre_prompt = input_text
             post_prompt = None
+        elif 'phi-3-vision' in self.model_type:
+            pre_prompt = "<|user|>\n<|image_1|>\n"
+            if input_text is None:
+                input_text = "Which city is this?"
+            post_prompt = input_text + "<|end|>\n<|assistant|>\n"
+            prompt = pre_prompt + post_prompt
+            processor = AutoProcessor.from_pretrained(args.hf_model_dir,
+                                                      trust_remote_code=True)
+            image = processor(text=prompt,
+                              images=raw_image,
+                              return_tensors="pt")
         elif self.model_type == "pix2struct":
             image_processor = AutoProcessor.from_pretrained(args.hf_model_dir)
             if input_text is None:
@@ -781,6 +1030,32 @@ class MultimodalModelRunner:
             # SteerLM prompt template
             pre_prompt = """<extra_id_0>System\nA chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions.\n\n<extra_id_1>User"""
             post_prompt = f"\n{input_text}\n<extra_id_1>Assistant\n<extra_id_2>quality:4,toxicity:0,humor:0,creativity:0,helpfulness:4,correctness:4,coherence:4,complexity:4,verbosity:4\n" ""
+
+        elif self.model_type == "llava_next":
+            if self.llm_name == "mistralai/Mistral-7B-Instruct-v0.2":
+                pre_prompt = "[INST] "
+                if input_text is None:
+                    input_text = "Question: which city is this? Answer:"
+                post_prompt = f"\n{input_text} [/INST]"
+                prompt = pre_prompt + post_prompt
+
+            elif self.llm_name == "NousResearch/Nous-Hermes-2-Yi-34B":
+                pre_prompt = "<|im_start|>system\nAnswer the questions.<|im_end|><|im_start|>user\n"
+                if input_text is None:
+                    input_text = "Question: which city is this? Answer:"
+                post_prompt = f"\n{input_text}<|im_end|><|im_start|>assistant\n"
+                prompt = pre_prompt + post_prompt
+
+            else:
+                raise Exception(
+                    f"Prompt template for {self.llm_name} for not included currently"
+                )
+
+            processor = AutoProcessor.from_pretrained(args.hf_model_dir,
+                                                      trust_remote_code=True)
+            image = processor(text=prompt,
+                              images=raw_image,
+                              return_tensors="pt")
 
         elif self.model_type in ['llava', 'vila', 'fuyu', 'kosmos-2']:
             # LLaVA and VILA
@@ -836,14 +1111,16 @@ class MultimodalModelRunner:
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         post_prompt = [post_prompt] * self.args.batch_size
-        if self.model_type not in ['fuyu', 'pix2struct', 'kosmos-2', 'vila']:
+        if self.model_type not in [
+                'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
+                'llava_next'
+        ]:
             if image.dim() == 5:
                 image = image.expand(args.batch_size, -1, -1, -1,
                                      -1).contiguous()
             else:
                 image = image.expand(args.batch_size, -1, -1, -1).contiguous()
         image = image.to(self.device)
-
         # Generate decoder_input_ids for enc-dec models
         # Custom prompts can be added as:
         # decoder_input_ids = model.tokenizer(decoder_prompt).input_ids
@@ -851,9 +1128,12 @@ class MultimodalModelRunner:
             decoder_input_ids = None
         else:
             config = AutoConfig.from_pretrained(args.hf_model_dir)
-            decoder_start_id = config.decoder_start_token_id  # T5
-            if decoder_start_id is None:
+            if "blip2" in self.model_type:
+                decoder_start_id = config.text_config.decoder_start_token_id  # T5
+            elif "nougat" in self.model_type:
                 decoder_start_id = config.decoder.bos_token_id  # Nougat
+            else:
+                decoder_start_id = config.decoder_start_token_id
 
             decoder_input_ids = torch.IntTensor([[decoder_start_id]])
             decoder_input_ids = decoder_input_ids.repeat((args.batch_size, 1))
@@ -863,7 +1143,6 @@ class MultimodalModelRunner:
     def run(self, input_text, input_image, max_new_tokens):
         input_text, pre_prompt, post_prompt, processed_image, decoder_input_ids, attention_mask = model.setup_inputs(
             input_text, input_image)
-
         model.generate(pre_prompt,
                        post_prompt,
                        processed_image,
@@ -907,7 +1186,9 @@ class MultimodalModelRunner:
                 elif self.model_type == "pix2struct":
                     assert "characteristic | cat food, day | cat food, wet | cat treats" in output_text[
                         0][0].lower()
-                elif self.model_type == 'neva':
+                elif self.model_type in [
+                        'blip2', 'neva', 'phi-3-vision', 'llava_next'
+                ]:
                     assert 'singapore' in output_text[0][0].lower()
                 elif self.model_type == 'video-neva':
                     assert 'robot' in output_text[0][0].lower()

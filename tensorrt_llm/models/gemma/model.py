@@ -251,7 +251,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
             'rotary_base': getattr(cfg, 'rotary_base', 10000.0),
             'rotary_scaling': getattr(cfg, 'rotary_scaling', None),
             'norm_epsilon': cfg.rms_norm_eps,
-            'quantization': quantization.asdict(),
+            'quantization': quantization.to_dict(),
             'mapping': {
                 'world_size': mapping.world_size,
                 'tp_size': mapping.world_size,
@@ -292,6 +292,7 @@ class GemmaForCausalLM(DecoderModelForCausalLM):
         return tllm_llama
 
     def check_config(self, config):
+        config.set_if_not_exist("share_embedding_table", True)
         config.set_if_not_exist('use_parallel_embedding', False)
         config.set_if_not_exist('embedding_sharding_dim', 0)
         config.set_if_not_exist('mlp_bias', False)

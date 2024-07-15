@@ -82,6 +82,9 @@ struct KvCacheStats
     SizeType32 freeNumBlocks;
     SizeType32 usedNumBlocks;
     SizeType32 toksPerBlock;
+    SizeType32 allocTotalBlocks;
+    SizeType32 allocNewBlocks;
+    SizeType32 reusedBlocks;
 };
 
 // Basic building block of a paged KV cache - a single
@@ -245,16 +248,6 @@ public:
         }
     }
 
-    void setNumPrepopulatedTokens(std::vector<int> numPrepopulatedTokens)
-    {
-        mNumPrepopulatedTokens = std::move(numPrepopulatedTokens);
-    }
-
-    [[nodiscard]] std::vector<int> const& getNumPrepopulatedTokens() const
-    {
-        return mNumPrepopulatedTokens;
-    }
-
 private:
     // Slot id of the sequence
     SizeType32 mSeqSlotIdx;
@@ -264,10 +257,6 @@ private:
     SizeType32 mBeamWidth;
     // List of blocks allocated for each beam of the sequence
     std::vector<std::vector<KVCacheBlock::IdType>> mCacheBlockIds;
-    // Number of tokens already in kv cache before context phase.
-    // A value > 0 indicates cached kv cache blocks were reused.
-    // One value per beam.
-    std::vector<int> mNumPrepopulatedTokens;
 };
 
 // BlockManager manages overall metadata of KVCacheBlocks in a layer of the
@@ -286,10 +275,11 @@ class BlockManager
 {
 public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
     explicit BlockManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead,
         SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool,
-        std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks);
+        std::shared_ptr<runtime::CudaStream> stream, bool onboardBlocks, CacheType cacheType = CacheType::kSELF);
 
     ~BlockManager();
 
@@ -326,6 +316,16 @@ public:
     [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept
     {
         return mFreePrimaryBlocks.size();
+    }
+
+    [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
+    {
+        return mAllocTotalBlocks;
+    }
+
+    [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
+    {
+        return mAllocNewBlocks;
     }
 
     [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
@@ -386,7 +386,10 @@ public:
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
-    void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx, SizeType32 seqSlotIdx);
+    void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
+
+    //! \brief Add single block to all beams of sequence.
+    void addBlockToAllBeams(BlockPtr& block, GenerationRequest& sequence);
 
     //! \brief Store blocks in cached blocks.
     //! \param blockedTokens Tokens of each block.
@@ -396,11 +399,8 @@ private:
     //! \brief Try to load blocks from cache. Allocate new blocks if necessary.
     //! \param blockedTokens Tokens of each block.
     //! \param sequence Sequence to which blocks are assigned.
-    //! \param beamIdx Beam of sequence to which blocks are assigned.
-    //! \param seqSlotIdx Batch slot of sequence to which blocks are assigned.
     //! \return Number of matched tokens from loaded blocks.
-    SizeType32 loadOrAllocateBlocks(std::list<VecTokens> const& blockedTokens, GenerationRequest& sequence,
-        SizeType32 beamIdx, SizeType32 seqSlotIdx);
+    SizeType32 loadOrAllocateBlocks(std::list<VecTokens> const& blockedTokens, GenerationRequest& sequence);
 
     //! \brief Find best primary block to free.
     //! \details The best primary block to free is the primary block that appears first in the queue and have no primary
@@ -453,6 +453,8 @@ private:
     BlockPtr mCachedBlocksRoot;
     // Statistics for block allocations/reuse
     std::size_t mAllocTotalBlocks, mAllocNewBlocks, mReusedBlocks;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
 };
 
 class KVCacheManager
@@ -461,11 +463,13 @@ public:
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
     using SequencesPtr = GenerationRequest::SharedPtr;
     using CudaStreamPtr = std::shared_ptr<runtime::CudaStream>;
+    using CacheType = tensorrt_llm::batch_manager::kv_cache_manager::CacheType;
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         SizeType32 blocksInPrimaryPool, SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences,
         SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, SizeType32 sinkTokenLength, bool useOneMoreBlock,
-        CudaStreamPtr stream, bool enableBlockReuse = false, bool onboardBlocks = true);
+        CudaStreamPtr stream, bool enableBlockReuse = false, bool onboardBlocks = true,
+        CacheType cacheType = CacheType::kSELF);
 
     void allocatePools(nvinfer1::DataType dtype, bool useUvm = false);
 
@@ -491,6 +495,21 @@ public:
         return mBlockManager.getNumFreeBlocks();
     }
 
+    [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
+    {
+        return mBlockManager.getNumAllocTotalBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
+    {
+        return mBlockManager.getNumAllocNewBlocks();
+    }
+
+    [[nodiscard]] SizeType32 getNumReusedBlocks() const noexcept
+    {
+        return mBlockManager.getNumReusedBlocks();
+    }
+
     [[nodiscard]] KvCacheStats getKvCacheStats() const
     {
         KvCacheStats kvCacheStats;
@@ -498,6 +517,9 @@ public:
         kvCacheStats.freeNumBlocks = getNumFreeBlocks();
         kvCacheStats.usedNumBlocks = getUsedNumBlocks();
         kvCacheStats.toksPerBlock = getTokensPerBlock();
+        kvCacheStats.allocTotalBlocks = getNumAllocTotalBlocks();
+        kvCacheStats.allocNewBlocks = getNumAllocNewBlocks();
+        kvCacheStats.reusedBlocks = getNumReusedBlocks();
 
         return kvCacheStats;
     }
@@ -562,12 +584,6 @@ public:
         nvinfer1::DataType dtype, tensorrt_llm::runtime::ModelConfig const& modelConfig,
         tensorrt_llm::runtime::WorldConfig const& worldConfig, runtime::BufferManager const& bufferManager);
 
-    [[nodiscard]] SizeType32 getNumPrepopulatedTokens(SizeType32 batchSlotIdx, SizeType32 beamIdx) const
-    {
-        auto const& prepopulatedTokens = mSequences.at(batchSlotIdx)->getNumPrepopulatedTokens();
-        return prepopulatedTokens.size() > 0 ? prepopulatedTokens.at(beamIdx) : 0;
-    }
-
     [[nodiscard]] bool isEnableBlockReuse() const
     {
         return mEnableBlockReuse;
@@ -575,6 +591,11 @@ public:
 
     void removeToken(SizeType32 seqSlotIdx);
     void rewindKVCache(SizeType32 seqSlotIdx, SizeType32 rewindLengths);
+
+    [[nodiscard]] bool isCrossKv() const
+    {
+        return mCacheType == CacheType::kCROSS;
+    }
 
 private:
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 seqSlotIdx,
@@ -610,5 +631,7 @@ private:
     runtime::ITensor::SharedPtr mSequenceBlockIndices;
     // Whether to cache KV pages for reuse
     bool mEnableBlockReuse;
+    // KV cache type (self or cross)
+    CacheType mCacheType;
 };
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

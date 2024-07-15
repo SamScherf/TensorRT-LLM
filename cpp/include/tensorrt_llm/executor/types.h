@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include <cuda_fp16.h>
 #ifdef ENABLE_FP8
 #include <cuda_fp8.h>
 #endif
@@ -52,8 +53,10 @@ using IterationType = std::uint64_t;
 using RandomSeedType = std::uint64_t;
 using VecLogProbs = std::vector<FloatType>;
 using StreamPtr = std::shared_ptr<tensorrt_llm::runtime::CudaStream>;
-using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr&)>;
+using LogitsPostProcessor = std::function<void(IdType, Tensor&, BeamTokens const&, StreamPtr const&)>;
 using LogitsPostProcessorMap = std::unordered_map<std::string, LogitsPostProcessor>;
+using LogitsPostProcessorBatched = std::function<void(std::vector<IdType> const&, std::vector<Tensor>&,
+    std::vector<std::reference_wrapper<BeamTokens const>> const&, StreamPtr const&)>;
 using MedusaChoices = std::vector<std::vector<SizeType32>>;
 
 enum class DataType
@@ -153,6 +156,8 @@ enum class MemoryType
 enum class ModelType
 {
     kDECODER_ONLY = 0,
+    kENCODER_ONLY = 1,
+    kENCODER_DECODER = 2,
 };
 
 /// @brief The batching type
@@ -221,6 +226,12 @@ struct KvCacheStats
     SizeType32 usedNumBlocks;
     /// @brief Number of tokens per block
     SizeType32 tokensPerBlock;
+    /// @brief Number of total allocated block
+    SizeType32 allocTotalBlocks;
+    /// @brief Number of newly allocated block
+    SizeType32 allocNewBlocks;
+    /// @brief Number of reused block
+    SizeType32 reusedBlocks;
 };
 
 /// @brief Struct that holds the stats of static batching models for a single iteration
@@ -264,8 +275,12 @@ struct IterationStats
     std::string timestamp;
     /// @brief Iteration id
     IterationType iter;
+    /// @brief Iteration latency (ms)
+    double iterLatencyMS;
     /// @brief Number of active requests
     SizeType32 numActiveRequests;
+    /// @brief Number of queued requests
+    SizeType32 numQueuedRequests;
     /// @brief Number of max active requests
     SizeType32 maxNumActiveRequests;
     /// @brief GPU memory usage in bytes
@@ -276,6 +291,8 @@ struct IterationStats
     size_t pinnedMemUsage;
     /// @brief Stats specific to KV caches
     std::optional<KvCacheStats> kvCacheStats;
+    /// @brief Stats specific to cross KV caches
+    std::optional<KvCacheStats> crossKvCacheStats;
     /// @brief Stats specific to static batching
     std::optional<StaticBatchingStats> staticBatchingStats;
     /// @brief Stats specific to inflight batching
@@ -288,13 +305,14 @@ enum class RequestStage
     /// @brief Request that have been received but not yet included in the active requests (due to constraints such as
     /// maximum batch size for example).
     kQUEUED,
+    /// @brief Active request in encoder phase
+    kENCODER_IN_PROGRESS,
     /// @brief Active request in context phase
     kCONTEXT_IN_PROGRESS,
     /// @brief Active request in generation phase
     kGENERATION_IN_PROGRESS,
     /// @brief Active request for which generation has completed
     kGENERATION_COMPLETE,
-
 };
 
 /// @brief Struct that holds the stats of a single request
@@ -339,37 +357,37 @@ public:
 
     static auto constexpr TopK()
     {
-        return DecodingMode{kTopK | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopK | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr TopP()
     {
-        return DecodingMode{kTopP | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr TopKTopP()
     {
-        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kTopKTopP | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr BeamSearch()
     {
-        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanWords | kStandardStopCriteria};
+        return DecodingMode{kBeamSearch | kUsePenalties | kUseBanTokens | kStandardStopCriteria};
     }
 
     static auto constexpr Medusa()
     {
-        return DecodingMode{kMedusa | kUseMinLength | kUseMaxLengthStop};
+        return DecodingMode{kMedusa | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr Lookahead()
     {
-        return DecodingMode{kLookahead | kUseMinLength | kUseMaxLengthStop};
+        return DecodingMode{kLookahead | kUseMinLength | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     static auto constexpr ExplicitDraftTokens()
     {
-        return DecodingMode{kExplicitDraftTokens | kUseMaxLengthStop | kUseExplicitEosStop};
+        return DecodingMode{kExplicitDraftTokens | kStandardStopCriteria | kUseExplicitEosStop};
     }
 
     auto constexpr useTemperature(bool useTemp)
@@ -408,9 +426,21 @@ public:
         return *this;
     }
 
+    auto constexpr useBanTokens(bool banTokens)
+    {
+        mState = setBitTo(kUseBanTokens, banTokens);
+        return *this;
+    }
+
     auto constexpr useBanWords(bool banWords)
     {
         mState = setBitTo(kUseBanWords, banWords);
+        return *this;
+    }
+
+    auto constexpr useNoRepeatNgramSize(bool noRepeatNgramSize)
+    {
+        mState = setBitTo(kUseNoRepeatNgramSize, noRepeatNgramSize);
         return *this;
     }
 
@@ -432,89 +462,99 @@ public:
         return *this;
     }
 
-    bool constexpr isAuto() const
+    [[nodiscard]] bool constexpr isAuto() const
     {
         return anyBitSet(kAuto);
     }
 
-    bool constexpr isTopK() const
+    [[nodiscard]] bool constexpr isTopK() const
     {
         return anyBitSet(kTopK);
     }
 
-    bool constexpr isTopP() const
+    [[nodiscard]] bool constexpr isTopP() const
     {
         return anyBitSet(kTopP);
     }
 
-    bool constexpr isTopKorTopP() const
+    [[nodiscard]] bool constexpr isTopKorTopP() const
     {
         return anyBitSet(kTopKTopP);
     }
 
-    bool constexpr isTopKandTopP() const
+    [[nodiscard]] bool constexpr isTopKandTopP() const
     {
         return allBitSet(kTopKTopP);
     }
 
-    bool constexpr isBeamSearch() const
+    [[nodiscard]] bool constexpr isBeamSearch() const
     {
         return anyBitSet(kBeamSearch);
     }
 
-    bool constexpr isMedusa() const
+    [[nodiscard]] bool constexpr isMedusa() const
     {
         return anyBitSet(kMedusa);
     }
 
-    bool constexpr isLookahead() const
+    [[nodiscard]] bool constexpr isLookahead() const
     {
         return anyBitSet(kLookahead);
     }
 
-    bool constexpr isExplicitDraftTokens() const
+    [[nodiscard]] bool constexpr isExplicitDraftTokens() const
     {
         return anyBitSet(kExplicitDraftTokens);
     }
 
-    bool constexpr isUseTemperature() const
+    [[nodiscard]] bool constexpr isUseTemperature() const
     {
         return anyBitSet(kUseTemperature);
     }
 
-    bool constexpr isUsePresencePenalty() const
+    [[nodiscard]] bool constexpr isUsePresencePenalty() const
     {
         return anyBitSet(kUsePresencePenalties);
     }
 
-    bool constexpr isUseFrequencyPenalty() const
+    [[nodiscard]] bool constexpr isUseFrequencyPenalty() const
     {
         return anyBitSet(kUseFrequencyPenalties);
     }
 
-    bool constexpr isUseRepetitionPenalty() const
+    [[nodiscard]] bool constexpr isUseRepetitionPenalty() const
     {
         return anyBitSet(kUseRepetitionPenalties);
     }
 
-    bool constexpr isUseMinLength() const
+    [[nodiscard]] bool constexpr isUseMinLength() const
     {
         return anyBitSet(kUseMinLength);
     }
 
-    bool constexpr isUseOccurrencePenalty() const
+    [[nodiscard]] bool constexpr isUseOccurrencePenalty() const
     {
         return anyBitSet(kUseOccurrencePenalties);
     }
 
-    bool constexpr isUsePenalty() const
+    [[nodiscard]] bool constexpr isUsePenalty() const
     {
         return anyBitSet(kUsePenalties);
     }
 
-    bool constexpr isUseBanWords() const
+    [[nodiscard]] bool constexpr isUseBanWords() const
     {
         return anyBitSet(kUseBanWords);
+    }
+
+    bool constexpr isUseNoRepeatNgramSize() const
+    {
+        return anyBitSet(kUseNoRepeatNgramSize);
+    }
+
+    bool constexpr isUseBanTokens() const
+    {
+        return anyBitSet(kUseBanTokens);
     }
 
     bool constexpr isUseStopWords() const
@@ -544,12 +584,12 @@ public:
         return mState == other.mState;
     }
 
-    constexpr DecodingMode(UnderlyingType state)
+    explicit constexpr DecodingMode(UnderlyingType state)
         : mState(state)
     {
     }
 
-    constexpr UnderlyingType getState() const
+    [[nodiscard]] constexpr UnderlyingType getState() const
     {
         return mState;
     }
@@ -566,11 +606,13 @@ private:
     static UnderlyingType constexpr kUseStopWords{1u << 6};
     static UnderlyingType constexpr kUseMaxLengthStop{1u << 7};
     static UnderlyingType constexpr kUseExplicitEosStop{1u << 8};
+    static UnderlyingType constexpr kUseNoRepeatNgramSize{1u << 9};
     static UnderlyingType constexpr kStandardStopCriteria{kUseStopWords | kUseMaxLengthStop};
     static UnderlyingType constexpr kUseOccurrencePenalties{
         kUseRepetitionPenalties | kUseFrequencyPenalties | kUsePresencePenalties};
     static UnderlyingType constexpr kUsePenalties{kUseOccurrencePenalties | kUseTemperature | kUseMinLength};
-    static SizeType32 constexpr kNumFlags{9};
+    static UnderlyingType constexpr kUseBanTokens{kUseNoRepeatNgramSize | kUseBanWords};
+    static SizeType32 constexpr kNumFlags{10};
     static UnderlyingType constexpr kAuto{1u << (kNumFlags + 0)};
     static UnderlyingType constexpr kTopK{1u << (kNumFlags + 1)};
     static UnderlyingType constexpr kTopP{1u << (kNumFlags + 2)};
@@ -580,12 +622,12 @@ private:
     static UnderlyingType constexpr kExplicitDraftTokens{1u << (kNumFlags + 6)};
     static UnderlyingType constexpr kTopKTopP{kTopK | kTopP};
 
-    bool constexpr anyBitSet(UnderlyingType bits) const
+    [[nodiscard]] bool constexpr anyBitSet(UnderlyingType bits) const
     {
         return (mState & bits) != 0;
     }
 
-    bool constexpr allBitSet(UnderlyingType bits) const
+    [[nodiscard]] bool constexpr allBitSet(UnderlyingType bits) const
     {
         return (mState & bits) == bits;
     }
@@ -621,12 +663,12 @@ static_assert(!DecodingMode::TopK()
                    .usePresencePenalty(false)
                    .useFrequencyPenalty(false)
                    .isUseOccurrencePenalty());
+static_assert(!DecodingMode::TopK().isAuto());
 static_assert(!DecodingMode::TopK().isTopKandTopP());
 static_assert(!DecodingMode::TopK().isTopP());
 static_assert(!DecodingMode::TopK().isBeamSearch());
 static_assert(!DecodingMode::TopK().isMedusa());
 static_assert(!DecodingMode::TopK().isLookahead());
-static_assert(!DecodingMode::TopK().isAuto());
 static_assert(!DecodingMode::TopK().isExplicitDraftTokens());
 
 static_assert(DecodingMode::TopP().isTopP());
@@ -634,12 +676,12 @@ static_assert(DecodingMode::TopP().isTopKorTopP());
 static_assert(DecodingMode::TopP().isUseBanWords());
 static_assert(DecodingMode::TopP().isUseOccurrencePenalty());
 static_assert(DecodingMode::TopP().isUseStopCriteria());
+static_assert(!DecodingMode::TopP().isAuto());
 static_assert(!DecodingMode::TopP().isTopKandTopP());
 static_assert(!DecodingMode::TopP().isTopK());
 static_assert(!DecodingMode::TopP().isBeamSearch());
 static_assert(!DecodingMode::TopP().isMedusa());
 static_assert(!DecodingMode::TopP().isLookahead());
-static_assert(!DecodingMode::TopP().isAuto());
 static_assert(!DecodingMode::TopP().isExplicitDraftTokens());
 
 static_assert(DecodingMode::TopKTopP().isTopK());
@@ -649,33 +691,31 @@ static_assert(DecodingMode::TopKTopP().isTopKandTopP());
 static_assert(DecodingMode::TopKTopP().isUseBanWords());
 static_assert(DecodingMode::TopKTopP().isUseOccurrencePenalty());
 static_assert(DecodingMode::TopKTopP().isUseStopCriteria());
+static_assert(!DecodingMode::TopKTopP().isAuto());
 static_assert(!DecodingMode::TopKTopP().isBeamSearch());
 static_assert(!DecodingMode::TopKTopP().isMedusa());
 static_assert(!DecodingMode::TopKTopP().isLookahead());
-static_assert(!DecodingMode::TopKTopP().isAuto());
 static_assert(!DecodingMode::TopKTopP().isExplicitDraftTokens());
 
 static_assert(DecodingMode::BeamSearch().isBeamSearch());
 static_assert(DecodingMode::BeamSearch().isUseStopCriteria());
+static_assert(!DecodingMode::BeamSearch().isAuto());
 static_assert(!DecodingMode::BeamSearch().isTopKorTopP());
 static_assert(!DecodingMode::BeamSearch().isMedusa());
 static_assert(!DecodingMode::BeamSearch().isLookahead());
-static_assert(!DecodingMode::BeamSearch().isAuto());
 static_assert(!DecodingMode::BeamSearch().isExplicitDraftTokens());
 
+static_assert(!DecodingMode::Medusa().isAuto());
 static_assert(!DecodingMode::Medusa().isTopK());
 static_assert(!DecodingMode::Medusa().isTopKorTopP());
 static_assert(!DecodingMode::Medusa().isTopKandTopP());
 static_assert(!DecodingMode::Medusa().isTopP());
 static_assert(!DecodingMode::Medusa().isBeamSearch());
 static_assert(!DecodingMode::Medusa().isLookahead());
-static_assert(!DecodingMode::Medusa().isAuto());
 static_assert(!DecodingMode::Medusa().isUseBanWords());
 static_assert(!DecodingMode::Medusa().isUseOccurrencePenalty());
 static_assert(!DecodingMode::Medusa().isExplicitDraftTokens());
 static_assert(DecodingMode::Medusa().isUseStopCriteria());
-static_assert(!DecodingMode::Medusa().isUseStopWords());
-static_assert(!DecodingMode::Medusa().isUseExplicitEosStop());
 static_assert(DecodingMode::Medusa().isUsePenalty());
 static_assert(DecodingMode::Medusa().isUseMinLength());
 static_assert(DecodingMode::Medusa().isMedusa());
@@ -689,8 +729,8 @@ static_assert(!DecodingMode::Lookahead().isBeamSearch());
 static_assert(!DecodingMode::Lookahead().isMedusa());
 static_assert(!DecodingMode::Lookahead().isExplicitDraftTokens());
 static_assert(DecodingMode::Lookahead().isUseStopCriteria());
-static_assert(!DecodingMode::Lookahead().isUseStopWords());
-static_assert(!DecodingMode::Lookahead().isUseExplicitEosStop());
+static_assert(DecodingMode::Lookahead().isUseStopWords());
+static_assert(DecodingMode::Lookahead().isUseExplicitEosStop());
 static_assert(DecodingMode::Lookahead().isLookahead());
 
 static_assert(!DecodingMode::ExplicitDraftTokens().isAuto());
@@ -703,9 +743,6 @@ static_assert(!DecodingMode::ExplicitDraftTokens().isMedusa());
 static_assert(!DecodingMode::ExplicitDraftTokens().isLookahead());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUsePenalty());
 static_assert(DecodingMode::ExplicitDraftTokens().isUseStopCriteria());
-static_assert(DecodingMode::ExplicitDraftTokens().isUseMaxLengthStop());
-static_assert(DecodingMode::ExplicitDraftTokens().isUseExplicitEosStop());
-static_assert(!DecodingMode::ExplicitDraftTokens().isUseStopWords());
 static_assert(!DecodingMode::ExplicitDraftTokens().isUseBanWords());
 static_assert(DecodingMode::ExplicitDraftTokens().isExplicitDraftTokens());
 } // namespace tensorrt_llm::executor

@@ -20,7 +20,9 @@
 #include "modelConfig.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
-#include "tensorrt_llm/common/stringUtils.h"
+#include "tensorrt_llm/runtime/explicitDraftTokensModule.h"
+#include "tensorrt_llm/runtime/lookaheadModule.h"
+#include "tensorrt_llm/runtime/medusaModule.h"
 
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -44,8 +46,8 @@ FieldType parseJsonFieldOr(Json const& json, std::string_view name, FieldType de
     }
     catch (nlohmann::json::out_of_range& e)
     {
-        TLLM_LOG_INFO("Parameter %s cannot be read from json:", std::string(name).c_str());
-        TLLM_LOG_INFO(e.what());
+        TLLM_LOG_DEBUG("Parameter %s cannot be read from json:", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
     }
     return value;
 }
@@ -60,13 +62,13 @@ std::optional<FieldType> parseJsonFieldOptional(Json const& json, std::string_vi
     }
     catch (nlohmann::json::out_of_range const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     catch (nlohmann::json::type_error const& e)
     {
-        TLLM_LOG_INFO(e.what());
-        TLLM_LOG_INFO("Optional value for parameter %s will not be set.", std::string(name).c_str());
+        TLLM_LOG_DEBUG(e.what());
+        TLLM_LOG_DEBUG("Optional value for parameter %s will not be set.", std::string(name).c_str());
     }
     return value;
 }
@@ -113,12 +115,13 @@ ModelConfig createModelConfig(
 {
     auto const& config = engineVersionNone ? json.at("builder_config") : json.at("pretrained_config");
 
-    auto const useCrossAttention = parseJsonFieldOptional<bool>(config, "cross_attention");
+    auto const* const archField = "architecture";
     auto const* const numLayersField = engineVersionNone ? "num_layers" : "num_hidden_layers";
     auto const* const numHeadsField = engineVersionNone ? "num_heads" : "num_attention_heads";
     auto const* const numKvHeadsField = engineVersionNone ? "num_kv_heads" : "num_key_value_heads";
     auto const* const mlpHiddenSizeField = engineVersionNone ? "mlp_hidden_size" : "intermediate_size";
 
+    auto const arch = engineVersionNone ? std::string("none") : config.at(archField).template get<std::string>();
     auto const numLayers = config.at(numLayersField).template get<SizeType32>();
     auto const numHeads = config.at(numHeadsField).template get<SizeType32>() / tensorParallelism;
     auto const layerStringTypes
@@ -133,6 +136,9 @@ ModelConfig createModelConfig(
     auto const hiddenSize = config.at("hidden_size").template get<SizeType32>() / tensorParallelism;
     auto const sizePerHead = parseJsonFieldOr(config, "head_size", hiddenSize / numHeads);
 
+    // Logits datatype
+    auto const logitsDtypeStr = parseJsonFieldOr(config, "logits_dtype", std::string("float32"));
+
     // TODO:
     // Code crashes when numKvHeads <= 0. Clamping downwards to 1 prevents that, make sure this is best fix.
     auto const numKvHeads
@@ -145,10 +151,24 @@ ModelConfig createModelConfig(
     modelConfig.setNbKvHeads(numKvHeads);
     modelConfig.setLayerTypes(layerTypes);
 
-    if (useCrossAttention.has_value())
-    {
-        modelConfig.useCrossAttention(useCrossAttention.value());
-    }
+    // Set logits datatype
+    auto logitsDtype = nvinfer1::DataType::kFLOAT;
+    if (logitsDtypeStr == "float32")
+        logitsDtype = nvinfer1::DataType::kFLOAT;
+    else if (logitsDtypeStr == "float16")
+        logitsDtype = nvinfer1::DataType::kHALF;
+    else
+        TLLM_THROW("Unsupported logits data type");
+    modelConfig.setLogitsDtype(logitsDtype);
+
+    // only enable cross attention for the decoder in encoder-decoder model
+    // TODO: add cross_attention and has_token_type_embedding as fields in pretrained config
+    auto const useCrossAttention = arch == std::string("DecoderModel") ? true : false;
+    auto const usePositionEmbedding = parseJsonFieldOr<bool>(config, "has_position_embedding", false);
+    auto const useTokenTypeEmbedding = parseJsonFieldOr<bool>(config, "has_token_type_embedding", false);
+    modelConfig.setUseCrossAttention(useCrossAttention);
+    modelConfig.setUsePositionEmbedding(usePositionEmbedding);
+    modelConfig.setUseTokenTypeEmbedding(useTokenTypeEmbedding);
 
     if (mlpHiddenSize.has_value())
     {
@@ -163,8 +183,7 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     auto const maxBatchSize = parseJsonFieldOr(builderConfig, "max_batch_size", 0);
     auto const maxBeamWidth = parseJsonFieldOr(builderConfig, "max_beam_width", 0);
     auto const maxInputLen = parseJsonFieldOr(builderConfig, "max_input_len", 0);
-    auto const maxSequenceLen = maxInputLen + parseJsonFieldOr(builderConfig, "max_output_len", 0);
-    auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
+    auto const maxSequenceLen = parseJsonFieldOr(builderConfig, "max_seq_len", 0);
     auto const maxNumTokens = parseJsonFieldOptional<SizeType32>(builderConfig, "max_num_tokens");
     auto const maxPromptEmbeddingTableSize
         = parseJsonFieldOr<SizeType32>(builderConfig, "max_prompt_embedding_table_size", 0);
@@ -178,7 +197,6 @@ void parseBuilderConfig(ModelConfig& modelConfig, Json const& builderConfig)
     modelConfig.setMaxInputLen(maxInputLen);
     modelConfig.setMaxSequenceLen(maxSequenceLen);
     modelConfig.setMaxNumTokens(maxNumTokens);
-    modelConfig.setMaxDraftLen(maxDraftLen);
     modelConfig.setMaxPromptEmbeddingTableSize(maxPromptEmbeddingTableSize);
     modelConfig.computeContextLogits(computeContextLogits);
     modelConfig.computeGenerationLogits(computeGenerationLogits);
@@ -196,9 +214,13 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     auto const& pagedKvCache = pluginConfig.at("paged_kv_cache");
     auto const& tokensPerBlock = pluginConfig.at("tokens_per_block");
     auto const useCustomAllReduce = pluginConfig.at("use_custom_all_reduce").template get<bool>();
+    auto const contextFMHA = pluginConfig.at("context_fmha").template get<bool>();
     auto const pagedContextFMHA = pluginConfig.at("use_paged_context_fmha").template get<bool>();
     auto const pagedState = parseJsonFieldOr(pluginConfig, "paged_state", false);
     auto const useXQA = parseJsonFieldOr(pluginConfig, "enable_xqa", false);
+
+    TLLM_CHECK_WITH_INFO(
+        !removeInputPadding || modelConfig.getMaxNumTokens(), "Padding removal requires max_num_tokens to be set.");
 
     modelConfig.useGptAttentionPlugin(useGptAttentionPlugin);
     modelConfig.useMambaConv1dPlugin(useMambaConv1dPlugin);
@@ -207,6 +229,7 @@ void parsePluginConfig(ModelConfig& modelConfig, Json const& pluginConfig)
     modelConfig.usePagedState(pagedState);
     modelConfig.setTokensPerBlock(tokensPerBlock);
     modelConfig.useCustomAllReduce(useCustomAllReduce);
+    modelConfig.setContextFMHA(contextFMHA);
     modelConfig.setPagedContextFMHA(pagedContextFMHA);
     modelConfig.useXQA(useXQA);
 }
@@ -221,7 +244,6 @@ void parseLora(ModelConfig& modelConfig, Json const& json, Json const& pluginCon
 
     if (loraTargetModules.has_value())
     {
-
         modelConfig.setLoraModules(LoraModule::createLoraModules(loraTargetModules.value(), modelConfig.getHiddenSize(),
             modelConfig.getMlpHiddenSize(), modelConfig.getNbHeads(), modelConfig.getNbKvHeads(),
             modelConfig.getSizePerHead(), tensorParallelism));
@@ -341,11 +363,24 @@ GptJsonConfig parseJson(InputType&& input)
     // Speculative decoding module
     if (!engineVersionNone)
     {
-        SizeType32 maxDraftLen{0};
-        if (modelConfig.getSpeculativeDecodingMode().isMedusa())
+        if (modelConfig.getSpeculativeDecodingMode().isExplicitDraftTokens())
         {
             auto const& pretrainedConfig = json.at("pretrained_config");
-            maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
+
+            // TODO(rkobus): adjust param names
+            auto const maxNumPaths = parseJsonFieldOr(pretrainedConfig, "explicit_num_beams", 0);
+            auto const maxDraftPathLen = parseJsonFieldOr(pretrainedConfig, "explicit_draft_len_per_beam", 0);
+            auto const maxDraftLen = maxNumPaths * maxDraftPathLen;
+
+            auto explicitDraftTokensModule
+                = std::make_shared<ExplicitDraftTokensModule>(maxDraftPathLen, maxDraftLen, maxNumPaths);
+            modelConfig.setSpeculativeDecodingModule(explicitDraftTokensModule);
+            modelConfig.setUseShapeInference(false);
+        }
+        else if (modelConfig.getSpeculativeDecodingMode().isMedusa())
+        {
+            auto const& pretrainedConfig = json.at("pretrained_config");
+            auto const maxDraftLen = parseJsonFieldOr(pretrainedConfig, "max_draft_len", 0);
             auto const medusaHeads = parseJsonFieldOptional<SizeType32>(pretrainedConfig, "num_medusa_heads");
             TLLM_CHECK_WITH_INFO(medusaHeads.has_value() && maxDraftLen > 0,
                 "Both num_medusa_heads and max_draft_len have to be provided for Medusa model");
@@ -355,7 +390,7 @@ GptJsonConfig parseJson(InputType&& input)
         }
         else
         {
-            maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
+            auto const maxDraftLen = parseJsonFieldOr(builderConfig, "max_draft_len", 0);
             if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
             {
                 TLLM_CHECK_WITH_INFO(
@@ -366,10 +401,12 @@ GptJsonConfig parseJson(InputType&& input)
             else if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
             {
                 TLLM_CHECK_WITH_INFO(
-                    maxDraftLen, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
+                    maxDraftLen > 0, "max_draft_len has to be larger than 0 for decoding with external draft tokens");
+                auto speculativeDecodingModule
+                    = std::make_shared<SpeculativeDecodingModule>(maxDraftLen, maxDraftLen, 1);
+                modelConfig.setSpeculativeDecodingModule(speculativeDecodingModule);
             }
         }
-        modelConfig.setMaxDraftLen(maxDraftLen);
     }
 
     // RNN config
@@ -390,10 +427,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = pretrainedConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = pretrainedConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = pretrainedConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = pretrainedConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (pretrainedConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = pretrainedConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }
@@ -412,10 +456,17 @@ GptJsonConfig parseJson(InputType&& input)
             auto const& stateSize = builderConfig.at("state_size").template get<SizeType32>();
             auto const& convKernel = builderConfig.at("conv_kernel").template get<SizeType32>();
             auto const& rnnHiddenSize = builderConfig.at("rnn_hidden_size").template get<SizeType32>();
+            auto const& rnnConvDimSize = builderConfig.at("rnn_conv_dim_size").template get<SizeType32>();
             ModelConfig::RnnConfig rnnConfig{};
             rnnConfig.stateSize = stateSize;
             rnnConfig.convKernel = convKernel;
             rnnConfig.rnnHiddenSize = rnnHiddenSize;
+            rnnConfig.rnnConvDimSize = rnnConvDimSize;
+            if (builderConfig.contains("rnn_head_size"))
+            {
+                auto const& rnnHeadSize = builderConfig.at("rnn_head_size").template get<SizeType32>();
+                rnnConfig.rnnHeadSize = rnnHeadSize;
+            }
             modelConfig.setRnnConfig(rnnConfig);
         }
     }

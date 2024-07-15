@@ -33,7 +33,8 @@ class AllreducePlugin : public BasePlugin
 {
 public:
     AllreducePlugin(std::set<int> group, nvinfer1::DataType type, kernels::AllReduceStrategyType strategy,
-        kernels::AllReduceStrategyConfig config, int32_t counter);
+        kernels::AllReduceStrategyConfig config, kernels::AllReduceFusionOp op, int32_t counter, float eps,
+        int8_t affine, int8_t bias);
 
     AllreducePlugin(void const* data, size_t length);
 
@@ -67,8 +68,9 @@ public:
     void destroy() noexcept override;
 
 private:
-    bool isCustomAllReduceSuported(int ranks_per_node) const noexcept;
+    bool isCustomAllReduceSupported(int ranks_per_node) const noexcept;
     void initGroupTopology() noexcept;
+    void setGroupTopology() noexcept;
     kernels::AllReduceStrategyType selectImplementation(
         size_t messageSize, int worldSize, nvinfer1::DataType type) noexcept;
 
@@ -80,7 +82,12 @@ private:
     nvinfer1::DataType mType;
     kernels::AllReduceStrategyType mStrategy;
     kernels::AllReduceStrategyConfig mConfig;
+    kernels::AllReduceFusionOp mOp;
+    float mEps;
     int32_t mCounter;
+    std::shared_ptr<ncclComm_t> mNcclComm;
+    int8_t mAffine;
+    int8_t mBias;
 };
 
 class AllreducePluginCreator : public BaseCreator

@@ -142,6 +142,18 @@ to the runtime, and will possibly be removed in the future releases. We have sup
 an auto fallback mechanism so that native NCCL kernel is used when hardware requirements
 are not satisfied to get the best performance.
 
+If you use `CUDA_VISIBLE_DEVICES` or `NVIDIA_VISIBLE_DEVICES`, please provide the full device list
+instead of limiting to single device, otherwise custom all reduce will be disabled since its kernels
+rely on P2P access to peer devices, which is not allowed when only a single device is visible.
+
+In addition, there is an experimental feature called "Reduce Norm Fusion"
+available to extend the custom AllReduce functionality. It can be enabled by
+using the `--reduce_fusion enable` argument with `trtllm-build` when the
+custom AllReduce is already enabled. This feature aims to fuse the ResidualAdd
+and LayerNorm kernels after AllReduce into a single kernel, resulting in
+improved end-to-end performance. Please note that currently, this feature is
+only supported for the llama model. It is recommended to enable this feature when the batch size is small and the generation phase time is the dominant factor.
+
 ### Embedding Parallelism, Embedding Sharing, and Look-Up Plugin
 
 The embedding parallelism feature enables the sharding of the embedding table
@@ -179,6 +191,19 @@ by using the `--use_fused_mlp` argument with `trtllm-build`. When the workload
 is very small, or if you're using FP8 PTQ and the accuracy after enabling it
 does not satisfy your requirement, it is not recommended to enable that feature.
 
+### GEMM + SwiGLU Fusion in Gated-MLP
+
+GEMM + SwiGLU fusion in Gated-MLP combines two Matmul operations and one SwiGLU
+operation into a single kernel. It only supports FP8 on Hopper now. For FP8 PTQ,
+the downside is slight reduction of accuracy because one of the quantization
+scaling factors are discarded.
+
+If model is large and you are running it on Hopper with FP8 precision, it is
+recommended to enable the feature by using the `--use_fused_mlp --gemm_swiglu_plugin fp8`
+argument with `trtllm-build`. When the workload is very small, or the accuracy
+after enabling it does not satisfy your requirement, it is not recommended to
+enable that feature.
+
 ### GEMM Plugin
 
 The GEMM plugin utilizes NVIDIA cuBLASLt to perform GEMM operations. On FP16 and
@@ -204,6 +229,15 @@ BERT attention plugin and context fused multi-head attention are both
 recommended for the BERT model. They are enabled by default using the
 `--bert_attention_plugin` and `--context_fmha` arguments with
 `trtllm-build`.
+
+### FP8 GEMM Plugin for Small Batch Size Performance Optimization
+
+FP8 gemm plugin is an experimental feature aimed to improve performance in
+small-batch-size cases(e.g. BS<=4) and can be enabled by `--gemm_plugin fp8`
+when building FP8 models. Although inputs with larger batch size can be correctly
+inferenced, the performance may decrease as batch size grows. Therefore, this
+feature is only recommended for latency reduction in small-batch-size scenarios
+currently.
 
 ## Runtime Options to Optimize the Performance of TensorRT-LLM Models?
 

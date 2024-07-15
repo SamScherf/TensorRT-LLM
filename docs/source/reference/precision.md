@@ -134,6 +134,7 @@ This release of TensorRT-LLM contains the following examples:
 | GPT-NeMo       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | GPT-NeoX       |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     Y      |
 | InternLM       |   Y   |   Y   |   Y   |   .   |    Y    |   Y   |   Y   |     .     |     .      |
+| InternLM2      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | LLaMA          |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | LLaMA-v2       |   Y   |   Y   |   Y   |   Y   |    Y    |   Y   |   Y   |     Y     |     Y      |
 | Mamba          |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
@@ -148,7 +149,7 @@ This release of TensorRT-LLM contains the following examples:
 | SantaCoder     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | Skywork        |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | StarCoder1     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
-| StarCoder2     |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
+| StarCoder2     |   Y   |   Y   |   Y   |   Y   |    .    |   Y   |   Y   |     .     |     .      |
 | T5             |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |
 | Whisper        |   Y   |   Y   |   Y   |   .   |    .    |   Y   |   Y   |     .     |     .      |
 | BLIP2-OPT      |   Y   |   Y   |   Y   |   .   |    .    |   .   |   .   |     .     |     .      |

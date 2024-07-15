@@ -39,7 +39,25 @@ def working_directory(path):
         os.chdir(prev_cwd)
 
 
-def main(build_type: str = "Release",
+def get_project_dir():
+    return Path(__file__).parent.resolve().parent
+
+
+def get_source_dir():
+    return get_project_dir() / "cpp"
+
+
+def get_build_dir(build_dir, build_type):
+    if build_dir is None:
+        build_dir = get_source_dir() / ("build" if build_type == "Release" else
+                                        f"build_{build_type}")
+    else:
+        build_dir = Path(build_dir)
+    return build_dir
+
+
+def main(*,
+         build_type: str = "Release",
          build_dir: Path = None,
          dist_dir: Path = None,
          cuda_architectures: str = None,
@@ -50,6 +68,7 @@ def main(build_type: str = "Release",
          nccl_root: str = None,
          clean: bool = False,
          use_ccache: bool = False,
+         fast_build: bool = False,
          cpp_only: bool = False,
          install: bool = False,
          skip_building_wheel: bool = False,
@@ -57,7 +76,7 @@ def main(build_type: str = "Release",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False):
-    project_dir = Path(__file__).parent.resolve().parent
+    project_dir = get_project_dir()
     os.chdir(project_dir)
     build_run = partial(run, shell=True, check=True)
 
@@ -65,9 +84,7 @@ def main(build_type: str = "Release",
         build_run('git submodule update --init --recursive')
     on_windows = platform.system() == "Windows"
     requirements_filename = "requirements-dev-windows.txt" if on_windows else "requirements-dev.txt"
-    build_run(
-        f"\"{sys.executable}\" -m pip install -r {requirements_filename} --extra-index-url https://pypi.ngc.nvidia.com"
-    )
+    build_run(f"\"{sys.executable}\" -m pip install -r {requirements_filename}")
     # Ensure TRT is installed on windows to prevent surprises.
     reqs = check_output([sys.executable, "-m", "pip", "freeze"])
     installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
@@ -131,13 +148,7 @@ def main(build_type: str = "Release",
         cmake_def_args.append(f"-DNCCL_LIB_DIR={nccl_root}/lib")
         cmake_def_args.append(f"-DNCCL_INCLUDE_DIR={nccl_root}/include")
 
-    source_dir = project_dir / "cpp"
-
-    if build_dir is None:
-        build_dir = source_dir / ("build" if build_type == "Release" else
-                                  f"build_{build_type}")
-    else:
-        build_dir = Path(build_dir)
+    build_dir = get_build_dir(build_dir, build_type)
     first_build = not build_dir.exists()
 
     if clean and build_dir.exists():
@@ -149,6 +160,9 @@ def main(build_type: str = "Release",
             f"-DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache"
         )
 
+    if fast_build:
+        cmake_def_args.append(f"-DFAST_BUILD=ON")
+
     build_pyt = "OFF" if cpp_only else "ON"
     th_common_lib = "" if cpp_only else "th_common"
     build_pybind = "OFF" if cpp_only else "ON"
@@ -159,6 +173,7 @@ def main(build_type: str = "Release",
     disable_nvtx = "OFF" if nvtx else "ON"
     executor_worker = "" if on_windows else "executorWorker "
 
+    source_dir = get_source_dir()
     with working_directory(build_dir):
         cmake_def_args = " ".join(cmake_def_args)
         if clean or first_build:
@@ -290,8 +305,7 @@ def main(build_type: str = "Release",
         build_run(f"\"{sys.executable}\" -m pip install -e .[devel]")
 
 
-if __name__ == "__main__":
-    parser = ArgumentParser()
+def add_arguments(parser: ArgumentParser):
     parser.add_argument("--build_type",
                         "-b",
                         default="Release",
@@ -304,6 +318,14 @@ if __name__ == "__main__":
                         default=False,
                         action="store_true",
                         help="Use ccache compiler driver")
+    parser.add_argument(
+        "--fast_build",
+        "-f",
+        default=False,
+        action="store_true",
+        help=
+        "Skip compiling some kernels to accelerate compilation -- for development only"
+    )
     parser.add_argument("--job_count",
                         "-j",
                         const=cpu_count(),
@@ -356,5 +378,10 @@ if __name__ == "__main__":
     parser.add_argument("--nvtx",
                         action="store_true",
                         help="Enable NVTX features.")
+
+
+if __name__ == "__main__":
+    parser = ArgumentParser()
+    add_arguments(parser)
     args = parser.parse_args()
     main(**vars(args))

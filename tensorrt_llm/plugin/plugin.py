@@ -59,7 +59,14 @@ class ContextFMHAType(IntEnum):
     enabled_with_fp32_acc = 2
 
 
-PLUGIN_DTYPE_OPTIONS = ["auto", "float16", "float32", "bfloat16", "int32", None]
+DEFAULT_PLUGIN_DTYPE_OPTIONS = [
+    "auto", "float16", "float32", "bfloat16", "int32", None
+]
+PLUGIN_DTYPE_OPTIONS_MAP = {
+    "gemm_swiglu_plugin": ["fp8", None],
+    "gemm_plugin":
+    ["auto", "float16", "float32", "bfloat16", "int32", "fp8", None]
+}
 
 
 def _make_plugin_property(field_name: str, field_type: type):
@@ -81,8 +88,11 @@ def _make_plugin_property(field_name: str, field_type: type):
                 assert isinstance(value, bool), \
                     f"Plugin {field_name} expects {field_type}, got {type(value)}"
             elif field_type in (str, Optional[str]):
-                assert value in PLUGIN_DTYPE_OPTIONS, \
-                    f"Plugin {field_name} expects values in {PLUGIN_DTYPE_OPTIONS}, got {value}"
+                plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
+                if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
+                    plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
+                assert value in plugin_dtype_options, \
+                    f"Plugin {field_name} expects values in {plugin_dtype_options}, got {value}"
             if field_name == 'dtype':
                 assert value not in ['auto', None], \
                     "Plugin dtype cannot be auto or None"
@@ -110,7 +120,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
 
     There are two option categories:
     * Plugin options (typically with xxx_plugin naming). These options can be assigned with:
-        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision;
+        * "float16"/"bfloat16"/"float32"/"int32", which means the plugin is enabled with the specified precision; (Some plugins only support limited dtype, i.e., gemm_swiglu_plugin only supports fp8 now)
         * "auto", which means the plugin is enabled with the precision of `dtype` field (the `dtype` field must be same to model dtype, i.e., the one in PretrainedConfig);
         * None, which means the plugin is disabled.
     * Other features. These options can be assigned with boolean:
@@ -126,6 +136,7 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _bert_attention_plugin: Optional[str] = field(default="auto", init=False)
     _gpt_attention_plugin: Optional[str] = field(default="auto", init=False)
     _gemm_plugin: Optional[str] = field(default=None, init=False)
+    _gemm_swiglu_plugin: Optional[str] = field(default=None, init=False)
     _smooth_quant_gemm_plugin: Optional[str] = field(default=None, init=False)
     _identity_plugin: Optional[str] = field(default=None, init=False)
     _layernorm_quantization_plugin: Optional[str] = field(default=None,
@@ -151,9 +162,9 @@ class PluginConfig(metaclass=PluginConfigMeta):
     _paged_kv_cache: bool = field(default=True, init=False)
     _remove_input_padding: bool = field(default=True, init=False)
     _use_custom_all_reduce: bool = field(default=True, init=False)
+    _reduce_fusion: bool = field(default=False, init=False)
     _multi_block_mode: bool = field(default=False, init=False)
     _enable_xqa: bool = field(default=True, init=False)
-    _attention_qk_half_accumulation: bool = field(default=False, init=False)
     _tokens_per_block: int = field(default=64, init=False)
     _use_paged_context_fmha: bool = field(default=False, init=False)
     _use_fp8_context_fmha: bool = field(default=False, init=False)
@@ -265,6 +276,7 @@ cli_plugin_args = [
     "bert_attention_plugin",
     "gpt_attention_plugin",
     "gemm_plugin",
+    "gemm_swiglu_plugin",
     "lookup_plugin",
     "lora_plugin",
     "moe_plugin",
@@ -279,13 +291,13 @@ cli_plugin_args = [
     "use_custom_all_reduce",
     "multi_block_mode",
     "enable_xqa",
-    "attention_qk_half_accumulation",
     "tokens_per_block",
     "use_paged_context_fmha",
     "use_fp8_context_fmha",
     "multiple_profiles",
     "paged_state",
     "streamingllm",
+    "reduce_fusion"
 ]
 
 
@@ -297,11 +309,14 @@ def add_plugin_argument(parser):
         if field_name not in cli_plugin_args:
             continue
         if field.type in (str, Optional[str]):
+            plugin_dtype_options = DEFAULT_PLUGIN_DTYPE_OPTIONS
+            if field_name in PLUGIN_DTYPE_OPTIONS_MAP:
+                plugin_dtype_options = PLUGIN_DTYPE_OPTIONS_MAP[field_name]
             parser.add_argument(
                 "--" + field_name,
                 type=str,
                 default=field.default if field.default else "disable",
-                choices=[x if x else "disable" for x in PLUGIN_DTYPE_OPTIONS],
+                choices=[x if x else "disable" for x in plugin_dtype_options],
                 help=f"Whether to enable/disable {field_name} and the dtype.")
         elif field.type == bool:
             parser.add_argument(

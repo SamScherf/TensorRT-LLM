@@ -7,42 +7,67 @@ Multimodal models' LLM part has an additional parameter `--max_multimodal_len` c
 
 We first describe how to run each model on a single GPU. We then provide general guidelines on using tensor parallelism for the LLM part of the pipeline.
 
-- [BLIP2-T5](#blip2-t5)
-- [BLIP2-OPT](#blip2-opt)
+- [BLIP2](#blip2)
 - [CogVLM](#cogvlm)
 - [Deplot](#deplot)
 - [Fuyu](#fuyu)
 - [Kosmos-2](#kosmos-2)
-- [LLaVA and VILA](#llava-and-vila)
-- [Neva](#neva)
-- [Video NeVA](#video-neva)
+- [LLaVA, LLaVa-NeXT and VILA](#llava-llava-next-and-vila)
+- [NeVA](#neva)
 - [Nougat](#nougat)
+- [Phi-3-vision](#phi-3-vision)
+- [Video NeVA](#video-neva)
 - [Enabling tensor parallelism for multi-GPU](#enabling-tensor-parallelism-for-multi-gpu)
 
-## BLIP2-T5
+## BLIP2
+
+This BLIP section covers both BLIP2-OPT and BLIP2-T5, with minor changes needed when switching the LLM backbone.
 
 1. Download Huggingface weights and convert original checkpoint to TRT-LLM checkpoint format
-   following example in `examples/enc_dec/README.md`.
+   following example in `examples/opt/README.md` and `examples/enc_dec/README.md`.
 
     ```bash
-    export MODEL_NAME="flan-t5-xl" # also flan-t5-xxl
-    git clone https://huggingface.co/google/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    export MODEL_NAME="blip2-opt-2.7b" # options: blip2-opt-6.7b, blip2-flan-t5-xl, blip2-flan-t5-xxl
+    git clone https://huggingface.co/Salesforce/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
 
-    python ../enc_dec/convert_checkpoint.py --model_type t5 \
+    For BLIP2-OPT family,
+    ```bash
+    python ../opt/convert_checkpoint.py --model_type blip2 \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+    ```
+
+    For BLIP2-T5 family,
+    ```bash
+    python ../enc_dec/convert_checkpoint.py --model_type blip2 \
         --model_dir tmp/hf_models/${MODEL_NAME} \
         --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
-        --dtype bfloat16 \
-        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
+        --dtype bfloat16
     ```
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
+    For BLIP2-OPT family,
     ```bash
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/encoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/encoder \
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gemm_plugin float16 \
+        --max_beam_width 1 \
+        --max_batch_size 8 \
+        --max_seq_len 1024 \
+        --max_input_len 924 \
+        --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
+    ```
+
+    For BLIP2-T5 family,
+    ```bash
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/encoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/encoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -54,13 +79,11 @@ We first describe how to run each model on a single GPU. We then provide general
         --context_fmha disable \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_output_len 100 \
         --max_input_len 924 \
         --max_multimodal_len 256 # 8 (max_batch_size) * 32 (num_visual_features)
 
-    # Same command for decoder but don't set --max_multimodal_len
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -72,19 +95,17 @@ We first describe how to run each model on a single GPU. We then provide general
         --context_fmha disable \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_output_len 100 \
+        --max_seq_len 1024 \
         --max_encoder_input_len 924 \
-        --max_input_len 1
+        --max_input_len 1 # Same command for decoder but don't set --max_multimodal_len
     ```
 
     **NOTE**: `max_multimodal_len = max_batch_size * num_visual_features`, so if you change max_batch_size, max multimodal length **MUST** be changed accordingly.
 
-    The built T5 engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1`.
-
-3. Build TensorRT engines for visual components
+3. Build TensorRT engines for vision encoders
 
     ```bash
-    python build_visual_engine.py --model_type ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8
+    python build_visual_engine.py --model_type blip2 --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 8
     ```
 
     The built engines are located in `./visual_engines/${MODEL_NAME}`.
@@ -93,46 +114,8 @@ We first describe how to run each model on a single GPU. We then provide general
 
 4. Assemble everything into BLIP2 pipeline
 
+    For BLIP2-OPT family,
     ```bash
-    python run.py \
-        --max_new_tokens 30 \
-        --input_text "Question: which city is this? Answer:" \
-        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
-        --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
-    ```
-
-## BLIP2-OPT
-
-OPT pipeline needs few minor changes from T5 pipeline
-
-1. Convert Huggingface weights to TRT-LLM checkpoint format following `examples/opt/README.md`.
-
-2. Use `trtllm-build` command to build TRT-LLM engine for OPT.
-
-3. The full list of commands is as follows:
-
-    ```bash
-    export MODEL_NAME="opt-2.7b" # also opt-6.7b
-    git clone https://huggingface.co/facebook/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
-
-    python ../opt/convert_checkpoint.py \
-        --model_dir tmp/hf_models/${MODEL_NAME} \
-        --dtype float16 \
-        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu
-
-    trtllm-build \
-        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
-        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --gemm_plugin float16 \
-        --max_beam_width 1 \
-        --max_batch_size 8 \
-        --max_multimodal_len 256 \
-        --max_input_len 924 \
-        --max_output_len 100
-
-    python build_visual_engine.py --model_type ${MODEL_NAME} --model_path tmp/hf_models/${MODEL_NAME}
-
     python run.py \
         --max_new_tokens 30 \
         --input_text "Question: which city is this? Answer:" \
@@ -141,7 +124,17 @@ OPT pipeline needs few minor changes from T5 pipeline
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
-4. INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
+    For BLIP2-T5 family,
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --input_text "Question: which city is this? Answer:" \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/bfloat16
+    ```
+
+5. (Optional) INT8/INT4 weight-only quantization for OPT can be enabled using commands as follows (take `INT4` as an example, while `INT8` is the default precision for weight-only quantization):
     ```bash
     python ../opt/convert_checkpoint.py \
         --model_dir tmp/hf_models/${MODEL_NAME} \
@@ -158,7 +151,7 @@ OPT pipeline needs few minor changes from T5 pipeline
         --max_batch_size 8 \
         --max_multimodal_len 256 \
         --max_input_len 924 \
-        --max_output_len 100
+        --max_seq_len 1024
     ```
 
     The built OPT engines lie in `trt_engines/${MODEL_NAME}/int4_weightonly/1-gpu`.
@@ -201,7 +194,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     --remove_input_padding disable \
     --max_batch_size 48 \
     --max_input_len 2048 \
-    --max_output_len 1024 \
+    --max_seq_len 3076 \
     --paged_kv_cache disable \
     --use_custom_all_reduce disable \
     --enable_xqa disable \
@@ -242,15 +235,14 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --output_dir tmp/trt_models/${MODEL_NAME}/float16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
         --dtype float16
     ```
 
 2. Build TRT-LLM engine from TRT-LLM checkpoint
 
     ```bash
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/float16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/float16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -262,12 +254,12 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --context_fmha disable \
         --max_beam_width 1 \
         --max_batch_size 8 \
-        --max_output_len 510 \
+        --max_seq_len 2558 \
         --max_encoder_input_len 2048 \
         --max_input_len 1
     ```
 
-    The built deplot engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1`.
+    The built deplot engines are located in `./tmp/trt_engines/${MODEL_NAME}/1-gpu/float16`.
 
 3. Build TensorRT engines for visual components
 
@@ -287,7 +279,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --input_text "" \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16/tp1
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/float16
     ```
 
 ## Fuyu
@@ -315,7 +307,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --use_fused_mlp \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 2048
     ```
 
@@ -327,7 +319,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
 ## Kosmos-2
@@ -354,7 +346,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 512 \
-        --max_output_len 512 \
+        --max_seq_len 1024 \
         --max_multimodal_len 64 # 1 (max_batch_size) * 64 (num_visual_features)
     ```
 
@@ -366,12 +358,12 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu
     ```
 
-## LLaVA and VILA
+## LLaVA, LLaVa-NeXT and VILA
 
-[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options.
+[LLaVA](https://github.com/haotian-liu/LLaVA) and [VILA](https://github.com/Efficient-Large-Model/VILA) are both visual language models (VLM) that can be deployed in TensorRT-LLM with many quantization options. [LLaVA-NeXT](https://huggingface.co/collections/llava-hf/llava-next-65f75c4afac77fd37dbbe6cf) is an extension of LLaVA. TRT-LLM currently supports [Mistral-7b](https://huggingface.co/llava-hf/llava-v1.6-mistral-7b-hf) and [ Nous-Hermes-2-Yi-34B](https://huggingface.co/llava-hf/llava-v1.6-34b-hf) variant of LLaVA-NeXT.
 
 1. Download Huggingface model weights. These models have both visual and LLM components
    unlike BLIP2 example which downloads only LLM components from Huggingface.
@@ -380,6 +372,12 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
 
     ```bash
         export MODEL_NAME="llava-1.5-7b-hf" # also llava-1.5-13b-hf
+        git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+    For LLaVA-NeXT,
+
+     ```bash
+        export MODEL_NAME="llava-v1.6-mistral-7b-hf" #for 34b variant "llava-v1.6-34b-hf"
         git clone https://huggingface.co/llava-hf/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
     ```
 
@@ -413,8 +411,20 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --use_fused_mlp \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 576 # 1 (max_batch_size) * 576 (num_visual_features) for LLaVA
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 5120 \
+        --max_num_tokens 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --max_multimodal_len 4096 \  # 1 (max_batch_size) * 4096 (max_input_len)
+        --use_fused_mlp
 
     trtllm-build \
         --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
@@ -423,7 +433,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --use_fused_mlp \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 4096 # 1 (max_batch_size) * 4096 (num_visual_features) for VILA
     ```
 
@@ -434,6 +444,8 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     ```bash
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava # for LLaVA
 
+    python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type llava_next --model_path tmp/hf_models/${MODEL_NAME} --max_batch_size 5 # 1 (max_batch_size) * 5 (because LLAVA-NeXT visual encoder can have at most 5 patches)  # for LLaVA-NeXT
+
     python build_visual_engine.py --model_path tmp/hf_models/${MODEL_NAME} --model_type vila --vila_path ${VILA_PATH} # for VILA
     ```
 
@@ -443,7 +455,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
-        --input_text "Question: which city is this? Answer:" # for LLaVA
+        --input_text "Question: which city is this? Answer:" # for LLaVA and for LLaVA-NeXT
     ```
 
     For VILA, you can use either local file or web url as input images.
@@ -491,7 +503,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 1024 \
-        --max_output_len 100 \
+        --max_seq_len 1124 \
         --max_multimodal_len 576 # for LLaVA
 
     trtllm-build \
@@ -501,7 +513,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --use_fused_mlp \
         --max_batch_size 1 \
         --max_input_len 1024 \
-        --max_output_len 100 \
+        --max_seq_len 1124 \
         --max_multimodal_len 4096 # for VILA
     ```
 
@@ -528,7 +540,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 1024 \
-        --max_output_len 100 \
+        --max_seq_len 1124 \
         --max_multimodal_len 576 # for LLaVA
 
     trtllm-build \
@@ -537,7 +549,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 4096 # for VILA
    ```
 
@@ -571,7 +583,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --gemm_plugin bfloat16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 729 # 1 (max_batch_size) * 729 (num_visual_features)
     ```
 
@@ -588,52 +600,6 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --visual_engine_dir visual_engines/${MODEL_NAME} \
         --llm_engine_dir trt_engines/${MODEL_NAME}/bf16/1-gpu \
         --input_text "Question: which city is this? Answer:"
-    ```
-
-    Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
-
-## Video NeVA
-
-[Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
-
-1. Generate TRT-LLM engine for Nemotron model following example in `examples/nemotron/README.md`. To adhere to the NVGPT conventions of the conversion script. This will be used as our base LM for inference.
-
-    ```bash
-    pip install decord # used for loading video
-
-    python3 ../quantization/quantize.py \
-        --nemo_ckpt_path /path/to/nemotron/model.nemo \
-        --dtype bfloat16 \
-        --batch_size 64 \
-        --qformat full_prec \
-        --output_dir nemotron-3/trt_ckpt/bf16/1-gpu
-
-
-    trtllm-build \
-        --checkpoint_dir nemotron-3/trt_ckpt/bf16/1-gpu \
-        --output_dir trt_engines/nemotron-3/bf16/1-gpu \
-        --gpt_attention_plugin bfloat16 \
-        --gemm_plugin bfloat16 \
-        --max_batch_size 1 \
-        --max_input_len 4096 \
-        --max_output_len 256 \
-        --max_multimodal_len 3072 # 1 (max_batch_size) * (12 num_frames) * (256 image_token_len)
-    ```
-
-2. Build TensorRT engines for visual components
-
-    ```bash
-    python build_visual_engine.py --model_path /path/to/video/neva/projector.nemo --model_type video-neva
-    ```
-
-    ```bash
-    python run.py \
-        --max_new_tokens 30 \
-        --hf_model_dir nemotron-3/trt_ckpt/bf16/1-gpu \
-        --visual_engine_dir visual_engines/video_neva_engine \
-        --llm_engine_dir trt_engines/nemotron-3/bf16/1-gpu \
-        --input_text "Question: what is in the video? Answer:" \
-        --video_path /path/to/your/local/video/file
     ```
 
     Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
@@ -659,12 +625,11 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --output_dir tmp/trt_models/${MODEL_NAME}/bfloat16 \
         --tp_size 1 \
         --pp_size 1 \
-        --weight_data_type float32 \
         --dtype bfloat16 \
         --nougat
 
-    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/tp1/pp1/decoder \
-        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1/decoder \
+    trtllm-build --checkpoint_dir tmp/trt_models/${MODEL_NAME}/bfloat16/decoder \
+        --output_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/decoder \
         --paged_kv_cache disable \
         --moe_plugin disable \
         --enable_xqa disable \
@@ -675,7 +640,7 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
         --remove_input_padding enable \
         --max_beam_width 1 \
         --max_batch_size 1 \
-        --max_output_len 100 \
+        --max_seq_len 101 \
         --max_input_len 1 \
         --max_encoder_input_len 588 # 1 (max_batch_size) * 588 (num_visual_features)
     ```
@@ -688,11 +653,96 @@ Currently, CogVLM only support bfloat16 precision and doesn't support `remove_in
     python run.py \
         --hf_model_dir tmp/hf_models/${MODEL_NAME} \
         --visual_engine_dir visual_engines/${MODEL_NAME} \
-        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16/tp1 \
+        --llm_engine_dir tmp/trt_engines/${MODEL_NAME}/1-gpu/bfloat16
     ```
 
     Note: Nougat models usually do not need a text prompt.
 
+
+## Phi-3-vision
+
+1. Download Huggingface weights
+
+    ```bash
+    export MODEL_NAME="Phi-3-vision-128k-instruct"
+    git clone https://huggingface.co/microsoft/${MODEL_NAME} tmp/hf_models/${MODEL_NAME}
+    ```
+
+2. Convert Huggingface weights into TRT-LLM checkpoints and build TRT engines using scripts in `examples/phi`.
+    ```bash
+    python ../gpt/convert_checkpoint.py \
+        --model_dir tmp/hf_models/${MODEL_NAME} \
+        --output_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --dtype float16
+
+    trtllm-build \
+        --checkpoint_dir tmp/trt_models/${MODEL_NAME}/fp16/1-gpu \
+        --output_dir trt_engines/${MODEL_NAME}/fp16/1-gpu \
+        --gpt_attention_plugin float16 \
+        --gemm_plugin float16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4608 \
+        --max_multimodal_len 4096
+    ```
+
+3. Generate TensorRT engines for visual components and combine everything into final pipeline.
+
+    ```bash
+    python build_visual_engine.py --model_type phi-3-vision --model_path tmp/hf_models/${MODEL_NAME}
+
+    python run.py \
+        --hf_model_dir tmp/hf_models/${MODEL_NAME} \
+        --visual_engine_dir visual_engines/${MODEL_NAME} \
+        --llm_engine_dir trt_engines/${MODEL_NAME}/fp16/1-gpu/ \
+        --image_path=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png
+    ```
+
+## Video NeVA
+
+[Video NeVA](https://github.com/NVIDIA/NeMo/blob/main/docs/source/multimodal/mllm/video_neva.rst) is a groundbreaking addition to the NeMo Multimodal ecosystem that could work with video modality. This model seamlessly integrates large language-centric models with a vision encoder, that can be deployed in TensorRT-LLM.
+
+1. Generate TRT-LLM engine for Nemotron model following example in `examples/nemotron/README.md`. To adhere to the NVGPT conventions of the conversion script. This will be used as our base LM for inference.
+
+    ```bash
+    pip install decord # used for loading video
+
+    python3 ../quantization/quantize.py \
+        --nemo_ckpt_path /path/to/nemotron/model.nemo \
+        --dtype bfloat16 \
+        --batch_size 64 \
+        --qformat full_prec \
+        --output_dir nemotron-3/trt_ckpt/bf16/1-gpu
+
+
+    trtllm-build \
+        --checkpoint_dir nemotron-3/trt_ckpt/bf16/1-gpu \
+        --output_dir trt_engines/nemotron-3/bf16/1-gpu \
+        --gpt_attention_plugin bfloat16 \
+        --gemm_plugin bfloat16 \
+        --max_batch_size 1 \
+        --max_input_len 4096 \
+        --max_seq_len 4352 \
+        --max_multimodal_len 3072 # 1 (max_batch_size) * (12 num_frames) * (256 image_token_len)
+    ```
+
+2. Build TensorRT engines for visual components
+
+    ```bash
+    python build_visual_engine.py --model_path /path/to/video/neva/projector.nemo --model_type video-neva
+    ```
+
+    ```bash
+    python run.py \
+        --max_new_tokens 30 \
+        --hf_model_dir nemotron-3/trt_ckpt/bf16/1-gpu \
+        --visual_engine_dir visual_engines/video_neva_engine \
+        --llm_engine_dir trt_engines/nemotron-3/bf16/1-gpu \
+        --input_text "Question: what is in the video? Answer:" \
+        --video_path /path/to/your/local/video/file
+    ```
+
+    Note: use `--run_profiling` for performance measurement, use `--check_accuracy` for accuracy check.
 
 ## Enabling tensor parallelism for multi-GPU
 
@@ -719,7 +769,7 @@ The full set of commands to enable 2-way tensor parallelism for LLaVA is:
         --gemm_plugin float16 \
         --max_batch_size 1 \
         --max_input_len 2048 \
-        --max_output_len 512 \
+        --max_seq_len 2560 \
         --max_multimodal_len 576
 
     python build_visual_engine.py --model_type llava --model_path tmp/hf_models/${MODEL_NAME}

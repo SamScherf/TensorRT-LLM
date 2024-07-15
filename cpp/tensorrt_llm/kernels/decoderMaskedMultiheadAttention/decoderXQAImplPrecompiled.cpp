@@ -160,7 +160,13 @@ public:
             : (xqaParams.kv_cache_quant_mode.hasFp8KvCache() ? KvCacheDataType::FP8 : KvCacheDataType::BASE);
 
         XQALaunchParam<KVCacheBuffer> launchParams;
-        buildXQALaunchParams(launchParams, xqaParams, kv_cache_buffer);
+        void* ioScratch = nullptr;
+        buildXQALaunchParams(launchParams, ioScratch, xqaParams, kv_cache_buffer);
+        bool const needOutputCvt = (xqaParams.fp8_out_scale != nullptr);
+        if (needOutputCvt)
+        {
+            launchParams.output = ioScratch;
+        }
 
         // Build cu_seqlens, padding_offset, and rotary inv freq tensors
         BuildDecoderInfoParams<T> decoder_params;
@@ -186,14 +192,14 @@ public:
 
         // IDEA: Store rotary_processed Q buffer to output buffer.
         // NOTE: MHA kernels should read kv cache that has already been appended with new tokens' kv cache.
-        void const* xqa_q_input_ptr = xqaParams.output;
+        void* xqa_q_input_ptr = ioScratch;
         QKVPreprocessingParams<T, KVCacheBuffer> preprocessingParms{static_cast<T*>(const_cast<void*>(xqaParams.qkv)),
-            nullptr, static_cast<T*>(const_cast<void*>(xqaParams.output)), kv_cache_buffer,
-            static_cast<T const*>(xqaParams.qkv_bias), xqaParams.spec_decoding_generation_lengths,
-            xqaParams.sequence_lengths, xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr,
-            launchParams.rotary_inv_freq_buf, (float2 const*) nullptr, xqaParams.kv_scale_orig_quant,
-            xqaParams.spec_decoding_position_offsets, int(batch_beam_size), xqaParams.generation_input_length,
-            xqaParams.timestep, xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
+            nullptr, static_cast<T*>(xqa_q_input_ptr), kv_cache_buffer, static_cast<T const*>(xqaParams.qkv_bias),
+            xqaParams.spec_decoding_generation_lengths, xqaParams.sequence_lengths,
+            xqaParams.multi_query_tokens ? launchParams.cu_seq_lens : nullptr, launchParams.rotary_inv_freq_buf,
+            (float2 const*) nullptr, xqaParams.kv_scale_orig_quant, xqaParams.spec_decoding_position_offsets,
+            int(batch_beam_size), xqaParams.generation_input_length, xqaParams.timestep,
+            xqaParams.cyclic_attention_window_size, xqaParams.sink_token_length,
             int(xqaParams.batch_size * beam_width * xqaParams.generation_input_length), xqaParams.num_q_heads,
             xqaParams.num_kv_heads, xqaParams.num_q_heads / xqaParams.num_kv_heads, xqaParams.head_size,
             xqaParams.rotary_embedding_dim, xqaParams.rotary_embedding_base, xqaParams.rotary_embedding_scale_type,
@@ -207,14 +213,7 @@ public:
         // Use mTileSize = 16 kernels when qSeqLen <= 16.
         unsigned int qSeqLen = static_cast<unsigned int>(xqaParams.generation_input_length);
         unsigned int mTileSize = qSeqLen <= 16 ? 16 : 32;
-        // MultiQueryToken kernels can support any num_q_heads_over_kv that is power of 2.
-        unsigned int kernel_num_q_heads_over_kv = xqaParams.multi_query_tokens ? 0 : num_q_heads_over_kv;
-        // MultiQueryToken kernels can handle either 16/32 for M direction per CTA.
-        unsigned int kernel_m_tilesize = xqaParams.multi_query_tokens ? mTileSize : num_q_heads_over_kv;
-        XQAKernelRuntimeHashKey hash_key{xqaParams.kv_cache_data_type, head_size, beam_width,
-            kernel_num_q_heads_over_kv, kernel_m_tilesize,
-            xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-            xqaParams.paged_kv_cache, xqaParams.multi_query_tokens};
+        XQAKernelRuntimeHashKey hash_key = getRuntimeHashKeyFromXQAParams(xqaParams);
         auto const findIter = mFunctions.find(hash_key);
 
         TLLM_CHECK_WITH_INFO(findIter != mFunctions.end(), "XQAKernelFunc not found.");
@@ -293,28 +292,15 @@ public:
         }
 
         sync_check_cuda_error();
-    }
 
-private:
-    static uint32_t getElemBytes(CUtensorMapDataType_enum dataType)
-    {
-        switch (dataType)
+        if (needOutputCvt)
         {
-        case CU_TENSOR_MAP_DATA_TYPE_UINT8: return 1;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_INT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_UINT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_INT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT64: return 8;
-        case CU_TENSOR_MAP_DATA_TYPE_BFLOAT16: return 2;
-        case CU_TENSOR_MAP_DATA_TYPE_FLOAT32_FTZ: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32: return 4;
-        case CU_TENSOR_MAP_DATA_TYPE_TFLOAT32_FTZ: return 4;
+            tensorrt_llm::kernels::invokeConversion<__nv_fp8_e4m3, T>(static_cast<__nv_fp8_e4m3*>(xqaParams.output),
+                static_cast<T const*>(launchParams.output),
+                xqaParams.head_size * xqaParams.num_q_heads * xqaParams.total_num_input_tokens, xqaParams.fp8_out_scale,
+                stream);
+            sync_check_cuda_error();
         }
-        throw std::runtime_error("unsupported data type");
     }
 
 protected:
@@ -405,12 +391,81 @@ void DecoderXQAImplPrecompiled::runDispatchBuffer(
 
 #undef XQA_KERNEL_RUN
 
-bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool /*forConfigurePlugin*/)
+#define SUPPORT_RETURN_FALSE(X)                                                                                        \
+    {                                                                                                                  \
+        return false;                                                                                                  \
+    }
+
+bool DecoderXQAImplPrecompiled::shouldUse(XQAParams const& xqaParams, bool forConfigurePlugin)
 {
+    if (!(xqaParams.data_type == DATA_TYPE_FP16 || xqaParams.data_type == DATA_TYPE_BF16))
+    {
+        SUPPORT_RETURN_FALSE("data type");
+    }
+    bool const isGPTJBeam4Kernel = (xqaParams.head_size == 256 && xqaParams.beam_width == 4 && xqaParams.paged_kv_cache
+        && (xqaParams.tokens_per_block == 64 || xqaParams.tokens_per_block == 128));
+    if (xqaParams.head_size != 128 && xqaParams.head_size != 256 && !isGPTJBeam4Kernel)
+    {
+        SUPPORT_RETURN_FALSE("head_size");
+    }
+    if (xqaParams.unidirectional != 1)
+    {
+        SUPPORT_RETURN_FALSE("unidirectional");
+    }
+    if (xqaParams.q_scaling != 1.0f)
+    {
+        SUPPORT_RETURN_FALSE("q_scaling");
+    }
+    if (xqaParams.mask_type != tensorrt_llm::kernels::AttentionMaskType::CAUSAL)
+    {
+        SUPPORT_RETURN_FALSE("mask_type");
+    }
+    if (xqaParams.cross_attention)
+    {
+        SUPPORT_RETURN_FALSE("cross_attention");
+    }
+    // Only support 64/128 tokens per block.
+    if (xqaParams.paged_kv_cache && xqaParams.tokens_per_block != 64 && xqaParams.tokens_per_block != 128)
+    {
+        SUPPORT_RETURN_FALSE("paged_kv_cache");
+    }
+    if (!forConfigurePlugin && xqaParams.host_past_key_value_lengths == nullptr)
+    {
+        SUPPORT_RETURN_FALSE("host_past_key_value_lengths");
+    }
+    if (xqaParams.beam_width != 1 && !isGPTJBeam4Kernel)
+    {
+        SUPPORT_RETURN_FALSE("beam_width");
+    }
+    if (xqaParams.cyclic_attention_window_size != xqaParams.max_attention_window_size)
+    {
+        SUPPORT_RETURN_FALSE("cyclic_attention_window_size != max_attention_window_size");
+    }
+    if (xqaParams.position_shift_enabled || xqaParams.sink_token_length > 0)
+    {
+        SUPPORT_RETURN_FALSE("streaming-llm");
+    }
+
+    // OPTIMIZE: For the standard generation-phase MHA, there are still extra limitations.
+    // NOTE: Medusa mode = Multi_query_tokens > 1.
+    int const nbQHeads = xqaParams.num_q_heads;
+    int const nbKVHeads = xqaParams.num_kv_heads;
+    int const nbQHeadsPerKV = nbQHeads / nbKVHeads;
+    // MultiQueryTokens mode (Medusa mode) can support any nbQHeadsPerKV.
+    if (!xqaParams.multi_query_tokens)
+    {
+        if (nbQHeadsPerKV != 8 && nbQHeadsPerKV != 1)
+        {
+            SUPPORT_RETURN_FALSE("nbHeads");
+        }
+    }
+
     XQAKernelList const* xqa_kernel = getXQAKernels(mRunner->mDataType, tensorrt_llm::common::getSMVersion());
     return xqa_kernel->supportConfig(xqaParams)
         && xqa_kernel->mayHavePerfGain(xqaParams, mRunner->mMultiProcessorCount);
 }
+
+#undef SUPPORT_RETURN_FALSE
 
 void DecoderXQAImplPrecompiled::prepare(XQAParams const&)
 {

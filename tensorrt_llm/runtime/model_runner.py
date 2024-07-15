@@ -34,7 +34,7 @@ from ..quantization import QuantMode
 from .generation import (ChatGLMGenerationSession, GenerationSession,
                          LogitsProcessor, LoraManager, ModelConfig,
                          QWenForCausalLMGenerationSession, SamplingConfig,
-                         StoppingCriteria)
+                         StoppingCriteria, to_word_list_format)
 
 
 def get_engine_name(model: str, dtype: str, tp_size: int, pp_size: int,
@@ -439,7 +439,7 @@ class ModelRunner(ModelRunnerMixin):
 
         rnn_config_items = [
             'conv_kernel', 'layer_types', 'rnn_hidden_size', 'state_size',
-            'state_dtype'
+            'state_dtype', 'rnn_head_size', 'rnn_conv_dim_size'
         ]
         rnn_configs_kwargs = {}
         for item in rnn_config_items:
@@ -480,14 +480,12 @@ class ModelRunner(ModelRunnerMixin):
                 pretrained_config, 'num_medusa_heads') else 0,
             use_custom_all_reduce=build_config.plugin_config.
             use_custom_all_reduce,
-            moe_tp_mode=pretrained_config.moe_tp_mode if hasattr(
-                pretrained_config, 'moe_tp_mode') else 0,
             **rnn_configs_kwargs,
             gpu_weights_percent=gpu_weights_percent,
         )
         max_batch_size = build_config.max_batch_size
         max_input_len = build_config.max_input_len
-        max_output_len = build_config.max_output_len
+        max_seq_len = build_config.max_seq_len
         max_beam_width = build_config.max_beam_width
         if pretrained_config.architecture == 'ChatGLMForCausalLM' and pretrained_config.chatglm_version in [
                 'glm', 'chatglm'
@@ -528,7 +526,7 @@ class ModelRunner(ModelRunnerMixin):
         return cls(session=session,
                    max_batch_size=max_batch_size,
                    max_input_len=max_input_len,
-                   max_seq_len=max_input_len + max_output_len,
+                   max_seq_len=max_seq_len,
                    max_beam_width=max_beam_width,
                    lora_manager=lora_manager)
 
@@ -770,6 +768,13 @@ class ModelRunner(ModelRunnerMixin):
         batch_size = len(batch_input_ids)
         batch_input_ids, input_lengths = self._prepare_inputs(
             batch_input_ids, sampling_config.pad_id)
+
+        if sampling_config.bad_words_list is not None:
+            sampling_config.bad_words_list = to_word_list_format(
+                sampling_config.bad_words_list)
+        if sampling_config.stop_words_list is not None:
+            sampling_config.stop_words_list = to_word_list_format(
+                sampling_config.stop_words_list)
 
         self.session.setup(
             batch_size=batch_size,

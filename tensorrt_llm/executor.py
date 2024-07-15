@@ -1,35 +1,26 @@
 import asyncio
+import atexit
 import datetime
 import secrets
+import threading
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from multiprocessing.connection import Client, Listener
 from pathlib import Path
 from queue import Queue
-from threading import Thread
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
 from janus import Queue as AsyncQueue
 
-from tensorrt_llm._utils import mpi_rank, mpi_world_size
-from tensorrt_llm.hlapi.mpi_session import (MpiPoolSession, MpiSession,
-                                            external_mpi_comm_available,
-                                            find_free_port,
-                                            need_spawn_mpi_workers)
-from tensorrt_llm.hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from tensorrt_llm.hlapi.utils import (ContextManager, GenerationOutput,
-                                      OutputConfig, SamplingConfig,
-                                      print_traceback_on_error)
-
-from . import bindings as tllm
 from ._utils import mpi_rank, mpi_world_size
-from .bindings import executor as tllme
+from .bindings import executor as tllm
 from .hlapi.mpi_session import (MpiPoolSession, MpiSession,
                                 external_mpi_comm_available, find_free_port,
                                 need_spawn_mpi_workers)
-from .hlapi.tokenizer import TokenizerBase, tokenizer_factory
-from .hlapi.utils import (ContextManager, GenerationOutput, SamplingConfig,
+from .hlapi.utils import (ContextManager, SamplingParams, exception_handler,
                           print_traceback_on_error)
 
 
@@ -45,85 +36,101 @@ class GenerationRequest:
 
     def __init__(
         self,
-        ids_or_prompt: Union[torch.Tensor, np.ndarray, list, str],
-        streaming: bool = True,
-        tokenizer: Optional[TokenizerBase] = None,
-        sampling_config: Optional[SamplingConfig] = None,
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        prompt_token_ids: Union[torch.Tensor, np.ndarray, list],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
     ):
-        if isinstance(ids_or_prompt, str):
-            assert tokenizer is not None, "GenerationRequest constructor with str prompt requires a tokenizer argument"
-            self.input_ids = (tokenizer.encode(ids_or_prompt,
-                                               return_tensors="pt",
-                                               return_attention_mask=False).to(
-                                                   torch.int32).numpy())
+        if isinstance(prompt_token_ids, list):
+            self.prompt_token_ids = prompt_token_ids
+        elif isinstance(prompt_token_ids, (torch.Tensor, np.ndarray)):
+            self.prompt_token_ids = prompt_token_ids.tolist()
         else:
-            if isinstance(ids_or_prompt, list):
-                self.input_ids = np.array(ids_or_prompt, dtype="int32")
-            elif isinstance(ids_or_prompt, torch.Tensor):
-                self.input_ids = ids_or_prompt.to(torch.int32).numpy()
-            elif isinstance(ids_or_prompt, np.ndarray):
-                self.input_ids = ids_or_prompt
-            else:
-                raise ValueError(
-                    f"ids_or_prompt (={ids_or_prompt}) should be an instance of str, torch.Tensor, np.ndarray or list"
-                )
+            raise TypeError(
+                f"prompt_token_ids ({prompt_token_ids}) should be an instance of torch.Tensor, np.ndarray or list"
+            )
 
-        self.tokenizer = tokenizer
+        self.sampling_params = sampling_params
         self.streaming = streaming
-        self.sampling_config = sampling_config or SamplingConfig()
-        self.output_config = output_config or OutputConfig()
-        self.stop_words = stop_words if stop_words is not None else []
-        self.bad_words = bad_words if bad_words is not None else []
-
         self.id = -1
 
     def set_id(self, id):
         self.id = id
         return self
 
-    def as_executor_request(self) -> tllme.Request:
-        # Request
-        end_id = self.tokenizer.eos_token_id if self.tokenizer is not None else None
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer is not None else None
-        if end_id is None:
-            end_id = self.sampling_config.end_id
-        pad_id = end_id if pad_id is None else pad_id
-
+    def as_executor_request(self) -> tllm.Request:
         request_kwargs = {
-            "input_token_ids": self.input_ids.squeeze().tolist(),
-            "max_new_tokens": self.sampling_config.max_new_tokens or 32,
-            "streaming": self.streaming,
-            "sampling_config": self.sampling_config,
-            "end_id": end_id,
-            "pad_id": pad_id,
-            "output_config": self.output_config,
+            "input_token_ids":
+            self.prompt_token_ids,
+            "max_new_tokens":
+            self.sampling_params.max_new_tokens,
+            "streaming":
+            self.streaming,
+            "sampling_config":
+            self.sampling_params._get_sampling_config(),
+            "end_id":
+            self.sampling_params.end_id,
+            "pad_id":
+            self.sampling_params.pad_id,
+            "output_config":
+            self.sampling_params._get_output_config(),
             # The following options in the Executor API are not yet exposed by the HLAPI:
             # https://jirasw.nvidia.com/browse/TRTLLM-489
-            "bad_words": self.bad_words,
-            "stop_words": self.stop_words,
-            "embedding_bias": None,  #TODO
-            "external_draft_tokens_config": None,  #TODO
-            "prompt_tuning_config": None,  #TODO
-            "lora_config": None,  #TODO
-            "logits_post_processor_name": None,  #TODO
+            "bad_words":
+            self.sampling_params._get_bad_words(),
+            "stop_words":
+            self.sampling_params._get_stop_words(),
+            "embedding_bias":
+            self.sampling_params.embedding_bias,
+            "external_draft_tokens_config":
+            self.sampling_params.external_draft_tokens_config,
+            "prompt_tuning_config":
+            self.sampling_params.prompt_tuning_config,
+            "lora_config":
+            self.sampling_params.lora_config,
+            "logits_post_processor_name":
+            self.sampling_params.logits_post_processor_name,
         }
-        request = tllme.Request(**request_kwargs)
+        request = tllm.Request(**request_kwargs)
         return request
 
 
-class GenerationResult(GenerationOutput):
+@dataclass(slots=True)
+class CompletionOutput:
+    """The output data of one completion output of a request.
 
-    def __init__(self,
-                 generation_request: GenerationRequest,
-                 tokenizer: Optional[TokenizerBase] = None) -> None:
+    Args:
+        index (int): The index of the output in the request.
+        text (str): The generated output text.
+        token_ids (List[int]): The token ids of the generated output text.
+        cumulative_logprob (float): The cumulative log probability of the generated output text.
+        logprobs (List[float]): The log probabilities of the top probability words at each position if the logprobs are requested.
+        generation_logits (torch.Tensor): The logits on the generated output token ids.
+    """
+    index: int
+    text: str = ""
+    token_ids: List[int] = field(default_factory=list)
+    cumulative_logprob: Optional[float] = None
+    logprobs: List[float] = field(default_factory=list)
+    generation_logits: Optional[torch.Tensor] = field(default=None, repr=False)
+    _last_text: str = field(default="", init=False, repr=False)
+
+    @property
+    def length(self):
+        return len(self.token_ids)
+
+    @property
+    def text_diff(self) -> str:
+        diff = self.text[len(self._last_text):]
+        self._last_text = self.text
+        return diff
+
+
+class GenerationResult:
+
+    def __init__(self, generation_request: GenerationRequest) -> None:
         self._done = False
         self._cancelled = False
-        self.generation_request = generation_request
-        self.tokenizer = tokenizer
-        self.streaming = generation_request.streaming
+        self._generation_request = generation_request
 
         if has_event_loop():
             aqueue = AsyncQueue()
@@ -133,60 +140,68 @@ class GenerationResult(GenerationOutput):
             self.queue = Queue()
             self.aqueue = None
 
-        beam_width = generation_request.sampling_config.beam_width
-
-        self.beam_search_enabled = beam_width > 1
-        self._token_ids = [[] for _ in range(beam_width)]
-
-        self.logprobs = []
-        self.last_text = ""
+        self.outputs: List[CompletionOutput] = [
+            CompletionOutput(i) for i in range(self.beam_width)
+        ]
+        self.context_logits: Optional[torch.Tensor] = None
 
     @property
-    def token_ids(self):
-        if not self.beam_search_enabled:
-            return self._token_ids[0]
-        return self._token_ids
+    def request_id(self) -> int:
+        return self._generation_request.id
+
+    @property
+    def prompt_token_ids(self) -> List[int]:
+        return self._generation_request.prompt_token_ids
+
+    @property
+    def finished(self) -> bool:
+        return self._done
+
+    @property
+    def streaming(self):
+        return self._generation_request.streaming
+
+    @property
+    def beam_width(self):
+        return self._generation_request.sampling_params.beam_width
 
     def handle_generation_msg(self, tensors: tuple, error: str):
         if error:
             raise RuntimeError(error)
 
-        output_token_ids, context_logits, generation_logits, log_probs = tensors
+        output_token_ids, context_logits, generation_logits, log_probs, cum_log_probs = tensors
 
-        for idx, beam_ids in enumerate(output_token_ids):
-            self._token_ids[idx] += beam_ids
+        for i, beam_ids in enumerate(output_token_ids):
+            self.outputs[i].token_ids.extend(beam_ids)
+            if cum_log_probs is not None:
+                self.outputs[i].cumulative_logprob = cum_log_probs[i]
+            if log_probs is not None:
+                self.outputs[i].logprobs = log_probs[i]
+                assert len(self.outputs[i].logprobs) == self.outputs[i].length
+            if generation_logits is not None:
+                self.outputs[i].generation_logits = generation_logits[
+                    i, :self.outputs[i].length]
 
-        self.context_logits = context_logits
-        self.generation_logits = generation_logits
-        self.log_probs = log_probs
+        if self.finished and not self._generation_request.sampling_params.include_stop_str_in_output:
+            for beam_output in self.outputs:
+                for stop_ids in self._generation_request.sampling_params._get_stop_words(
+                ):
+                    if beam_output.token_ids[-len(stop_ids):] == stop_ids:
+                        beam_output.token_ids = beam_output.token_ids[:-len(
+                            stop_ids)]
+                        break
+
+        if context_logits is not None:
+            self.context_logits = context_logits
 
     def result_step(self, timeout: Optional[float] = None):
         _, tensors, self._done, error = self.queue.get(timeout=timeout)
         self.handle_generation_msg(tensors, error)
 
     async def aresult_step(self):
-        assert self.aqueue is not None
+        assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
         _, tensors, self._done, error = await self.aqueue.get()
         self.handle_generation_msg(tensors, error)
-
-    @property
-    def text_diff(self) -> str:
-        assert self.streaming is not None
-        assert not self.beam_search_enabled, "text_diff is not supported with beam_search"
-
-        new_txt = self.text
-        diff = new_txt[len(self.last_text):]
-        self.last_text = new_txt
-        return diff
-
-    @property
-    def text(self) -> Union[str, List[str]]:
-        if self.tokenizer is None:
-            return ''
-        texts = self.tokenizer.batch_decode(self._token_ids)
-        if not self.beam_search_enabled:
-            return texts[0]
-        return texts
 
     def result(self, timeout: Optional[float] = None) -> "GenerationResult":
         while not self._done:
@@ -197,6 +212,9 @@ class GenerationResult(GenerationOutput):
         while not self._done:
             await self.aresult_step()
         return self
+
+    def __await__(self):
+        return self.aresult().__await__()
 
     def __iter__(self):
         return self
@@ -236,13 +254,32 @@ class GenerationResult(GenerationOutput):
         except RuntimeError as e:
             return e
 
+    def _repr_fields(self):
+        return ['request_id', 'prompt_token_ids', 'outputs', 'finished']
+
+    def __repr__(self) -> str:
+        repr = []
+        for field in self._repr_fields():
+            value = getattr(self, field)
+            if isinstance(value, str):
+                repr.append(f"{field}={value!r}")
+            else:
+                repr.append(f"{field}={value}")
+        repr = ", ".join(repr)
+        repr = f"{self.__class__.__name__}({repr})"
+        return repr
+
 
 class GenerationExecutor(ABC):
     TERMINATE_REQUEST_ID = 0
 
     def __init__(self):
         self.id_counter = GenerationExecutor.TERMINATE_REQUEST_ID + 1
-        self.tokenizer = None
+        self._stats = None
+        self.stats_queue = None
+
+        exception_handler.register(self)
+        atexit.register(self.shutdown)
 
     def generate_id(self) -> int:
         gen_id = self.id_counter
@@ -262,93 +299,77 @@ class GenerationExecutor(ABC):
 
     def generate_async(
         self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool,
-        sampling_config: Union[SamplingConfig, List[SamplingConfig]],
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
-    ) -> Union[GenerationResult, List[GenerationResult]]:
-        unbatched = isinstance(prompt, str) or (isinstance(prompt, list)
-                                                and isinstance(prompt[0], int))
-        string_input = isinstance(
-            prompt, str) or (not unbatched and isinstance(prompt[0], str))
-        tokenizer = self.tokenizer if string_input else None
-
-        stop_words = stop_words if stop_words is not None else []
-        bad_words = bad_words if bad_words is not None else []
-
-        if unbatched:
-            results = self.submit(
-                GenerationRequest(prompt,
-                                  streaming,
-                                  tokenizer,
-                                  sampling_config=sampling_config,
-                                  output_config=output_config,
-                                  stop_words=stop_words,
-                                  bad_words=bad_words))
-        else:
-            sampling_config = [sampling_config] * len(prompt) if not isinstance(
-                sampling_config, list) else sampling_config
-            results = []
-            for idx, p in enumerate(prompt):
-                results.append(
-                    self.submit(
-                        GenerationRequest(p,
-                                          streaming,
-                                          tokenizer,
-                                          sampling_config=sampling_config[idx],
-                                          output_config=output_config,
-                                          stop_words=stop_words,
-                                          bad_words=bad_words)))
-        return results
+        prompt_token_ids: List[int],
+        sampling_params: SamplingParams,
+        streaming: bool = False,
+    ) -> GenerationResult:
+        """Generate output for the given prompt token ids in the asynchronous mode.
+        Asynchronous generation accepts single prompt only.
+        """
+        assert isinstance(prompt_token_ids[0], int)
+        assert isinstance(sampling_params, SamplingParams)
+        result = self.submit(
+            GenerationRequest(prompt_token_ids,
+                              sampling_params=sampling_params,
+                              streaming=streaming))
+        return result
 
     def generate(
-        self,
-        prompt: Union[str, List[int], List[str], List[List[int]]],
-        streaming: bool = False,
-        sampling_config: Optional[Union[SamplingConfig,
-                                        List[SamplingConfig]]] = None,
-        output_config: Optional[tllme.OutputConfig] = None,
-        bad_words: Optional[List[List[int]]] = None,
-        stop_words: Optional[List[List[int]]] = None,
+        self, prompt_token_ids: Union[List[int], List[List[int]]],
+        sampling_params: Union[SamplingParams, List[SamplingParams]]
     ) -> Union[GenerationResult, List[GenerationResult]]:
-        futures = self.generate_async(prompt,
-                                      streaming=streaming,
-                                      sampling_config=sampling_config,
-                                      output_config=output_config,
-                                      bad_words=bad_words,
-                                      stop_words=stop_words)
-        if isinstance(futures, GenerationRequest):
-            futures.result()
-        else:
-            for future in futures:
-                future.result()
+        """Generate output for the given prompt token ids in the synchronous mode.
+        Synchronous generation accepts either single prompt or batched prompts.
+        """
+        unbatched = isinstance(prompt_token_ids[0], int)
+
+        if unbatched:
+            prompt_token_ids = [prompt_token_ids]
+
+        futures = []
+        for i, p in enumerate(prompt_token_ids):
+            if isinstance(sampling_params, list):
+                sp = sampling_params[i]
+            else:
+                sp = sampling_params
+            future = self.generate_async(p, sampling_params=sp, streaming=False)
+            futures.append(future)
+
+        for future in futures:
+            future.result()
+
+        if unbatched:
+            futures = futures[0]
+
         return futures
 
     @abstractmethod
     def shutdown(self):
         pass
 
-    @abstractmethod
-    def get_stats(self):
-        pass
+    def create_stats_queue(self):
+        # Stats queue is created during first submission to ensure event loop exists if it is needed.
+        if not self._stats:
+            if has_event_loop():
+                self._stats = AsyncQueue()
+                self.stats_queue = self._stats.sync_q
+                self.stats_aqueue = self._stats.async_q
+            else:
+                self._stats = Queue()
+                self.stats_queue = self._stats
+                self.stats_aqueue = None
 
-    @abstractmethod
+    def get_stats(self):
+        return self.stats_queue.get()
+
     async def aget_stats(self):
-        pass
+        assert self.stats_aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
+        return await self.stats_aqueue.get()
 
     @staticmethod
     def create(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
         model_world_size: int = 1,
         world_size: int = 0,
         mpi_session: Optional[MpiSession] = None,
@@ -366,10 +387,6 @@ class GenerationExecutor(ABC):
 
         worker_kwargs = {
             "engine_dir": engine_dir,
-            "tokenizer": tokenizer,
-            "max_beam_width": max_beam_width,
-            "executor_type": executor_type,
-            "scheduler_config": scheduler_config,
             "executor_config": executor_config,
         }
 
@@ -395,61 +412,24 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def __init__(
         self,
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase, None],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams(),
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1),
     ) -> None:
         super().__init__()
 
         self.engine = None
-        self.tokenizer = tokenizer_factory(tokenizer)
-        self._stats = None
         self._results: Dict[int, GenerationResult] = {}
         self._pending: set = set()
         self.result_queue = None
         self.rank = mpi_rank()
 
-        # Convert config to Executor config.
-        config = tllme.ExecutorConfig(
-            max_beam_width,
-            batching_type=self.convert_executor_type(executor_type),
-            scheduler_config=scheduler_config)
-        # Translate additional options from TrtGptModelOptionalParams
-        config.kv_cache_config = tllme.KvCacheConfig(
-            enable_block_reuse=executor_config.kv_cache_config.
-            enable_block_reuse,
-            max_tokens=executor_config.kv_cache_config.max_tokens,
-            max_attention_window=executor_config.kv_cache_config.
-            max_attention_window,
-            sink_token_length=executor_config.kv_cache_config.sink_token_length,
-            free_gpu_memory_fraction=executor_config.kv_cache_config.
-            free_gpu_memory_fraction)
-        if executor_config.device_ids:
-            config.parallel_config = tllme.ParallelConfig(
-                device_ids=executor_config.device_ids)
-        config.enable_chunked_context = executor_config.enable_chunked_context
-        config.normalize_log_probs = executor_config.normalize_log_probs
-        config.decoding_config = executor_config.decoding_config
-        assert not executor_config.enable_trt_overlap, "enable_trt_overlap is not supported."
-        self.engine = tllme.Executor(engine_dir,
-                                     tllme.ModelType.DECODER_ONLY,
-                                     executor_config=config)
-        self.awaiter_thread = Thread(target=self.awaiter_loop)
-        self.running = True
-
-    def convert_executor_type(self, executor_type):
-        batching_type_map = {
-            tllm.TrtGptModelType.V1: tllme.BatchingType.STATIC,
-            tllm.TrtGptModelType.InflightFusedBatching:
-            tllme.BatchingType.INFLIGHT,
-        }
-        assert executor_type in batching_type_map, f"executor_type={executor_type} is not supported."
-        return batching_type_map[executor_type]
+        self.engine = tllm.Executor(engine_dir,
+                                    tllm.ModelType.DECODER_ONLY,
+                                    executor_config=executor_config)
+        self.awaiter_stop_event = threading.Event()
+        self.awaiter_thread = threading.Thread(target=self.awaiter_loop,
+                                               daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_loop,
+                                             daemon=True)
 
     def create_stats_queue(self):
         # Stats queue is created during first submission to ensure event loop exists if it is needed.
@@ -464,7 +444,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
                 self.stats_aqueue = None
 
     def set_result_queue(self, queue):
+        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
         self.result_queue = queue
+
+    def set_stats_queue(self, queue):
+        """In multi-gpu mode, stats_queue will be set here to communicate between the proxy and the worker 0 process."""
+        self._stats = queue
+        self.stats_queue = self._stats
+        self.stats_aqueue = None
 
     def return_queue(self, req_id: int):
         """ If a centralized result queue is registered (used for communication with the proxy)
@@ -481,9 +468,14 @@ class ExecutorBindingsWorker(GenerationExecutor):
         ) and not self.awaiter_thread.is_alive():
             self.awaiter_thread.start()
 
+    def start_stats_thread(self):
+        if self.engine.can_enqueue_requests(
+        ) and not self.stats_thread.is_alive():
+            self.stats_thread.start()
+
     def awaiter_loop(self):
         """ Gets responses from executor and places in the return queue."""
-        while self.running:
+        while not self.awaiter_stop_event.is_set():
             # Get responses and place in queue.
             for response in self.engine.await_responses(
                     timeout=datetime.timedelta(milliseconds=100)):
@@ -497,47 +489,53 @@ class ExecutorBindingsWorker(GenerationExecutor):
                         response.result.context_logits,
                         response.result.generation_logits,
                         response.result.log_probs,
+                        response.result.cum_log_probs,
                     )
                     self.return_queue(req_id).put(
                         (response.request_id, tensors, response.result.is_final,
                          None))
                     if response.result.is_final:
                         self._pending.remove(req_id)
+
+    def stats_loop(self):
+        while not self.awaiter_stop_event.is_set():
+            time.sleep(0.1)
             # Get stats and place in queue.
             for stats in self.engine.get_latest_iteration_stats():
-                while self.stats_queue.full():
+                while hasattr(self.stats_queue,
+                              "full") and self.stats_queue.full():
                     self.stats_queue.get()
                 self.stats_queue.put(stats.to_json_str())
+
+    def start(self):
+        self.create_stats_queue()
+        self.start_awaiter_thread()
+        self.start_stats_thread()
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """
             Low-level API to the executor. Return a "future" GenerationResult which can be waited.
         """
+        self.start()
+
         if self.rank != 0:
             raise NotImplementedError("Only rank 0 can submit requests.")
-        self.create_stats_queue()
-        self.start_awaiter_thread()
         req_id = self.engine.enqueue_request(request.as_executor_request())
         request.set_id(req_id)
 
-        result = GenerationResult(request, request.tokenizer)
+        result = GenerationResult(request)
         self._results[req_id] = result
         self._pending.add(req_id)
         return result
 
-    def get_stats(self):
-        return self.stats_queue.get()
-
-    async def aget_stats(self):
-        assert self.stats_aqueue is not None
-        return await self.stats_aqueue.get()
-
     def shutdown(self):
         if self.engine is not None:
-            self.running = False
+            self.awaiter_stop_event.set()
             if self.engine.can_enqueue_requests():
                 if self.awaiter_thread.is_alive():
                     self.awaiter_thread.join()
+                if self.stats_thread.is_alive():
+                    self.stats_thread.join()
             self.engine.shutdown()
             self.engine = None
 
@@ -561,12 +559,12 @@ class ExecutorBindingsWorker(GenerationExecutor):
     def wait_first_completed(
         self, futures: List[GenerationResult]
     ) -> Generator[GenerationResult, None, None]:
-        wait_set = set(f.generation_request.id for f in futures)
+        wait_set = set(f.request_id for f in futures)
 
         # clear already-finished requests
         for f in futures:
             if f._done:
-                wait_set.remove(f.generation_request.id)
+                wait_set.remove(f.request_id)
                 yield f
 
         # wait remaining active requests
@@ -618,7 +616,6 @@ class ExecutorBindingsProxy(GenerationExecutor):
         super().__init__()
 
         self.workers_started = False
-        self.tokenizer = tokenizer_factory(workers_kwargs["tokenizer"])
 
         request_queue_addr = ("127.0.0.1", find_free_port(),
                               secrets.token_bytes(512))
@@ -633,7 +630,12 @@ class ExecutorBindingsProxy(GenerationExecutor):
                              secrets.token_bytes(512))
         self.result_queue = Fifo(result_queue_addr, is_server=True)
 
+        stats_queue_addr = ("127.0.0.1", find_free_port(),
+                            secrets.token_bytes(512))
+        self.mp_stats_queue = Fifo(stats_queue_addr, is_server=True)
+
         self._results: Dict[int, GenerationResult] = {}
+        self._request_id_dispatcher_queue = Queue(maxsize=100)
 
         if mpi_session is None:
             self.mpi_session = MpiPoolSession(n_workers=model_world_size)
@@ -646,24 +648,23 @@ class ExecutorBindingsProxy(GenerationExecutor):
             "request_queue_addr": request_queue_addr,
             "request_id_queue_addr": request_id_queue_addr,
             "result_queue_addr": result_queue_addr,
+            "stats_queue_addr": stats_queue_addr,
         })
-        self.dispatcher = Thread(target=self.dispatcher_thread)
+        self.workers_init_ok = False
+        self.dispatcher = threading.Thread(target=self.dispatcher_thread,
+                                           daemon=True)
+        self.stats_thread = threading.Thread(target=self.stats_main,
+                                             daemon=True)
 
     @print_traceback_on_error
     @staticmethod
     def workers_main(
         engine_dir: Path,
-        tokenizer: Union[str, Path, TokenizerBase],
         request_queue_addr: Tuple[str, int, bytes],
         request_id_queue_addr: Tuple[str, int, bytes],
         result_queue_addr: Tuple[str, int, bytes],
-        max_beam_width: int = 1,
-        executor_type: tllm.TrtGptModelType = tllm.TrtGptModelType.
-        InflightFusedBatching,
-        scheduler_config: tllme.SchedulerConfig = tllme.SchedulerConfig(
-            tllme.CapacitySchedulerPolicy.GUARANTEED_NO_EVICT),
-        executor_config: tllm.TrtGptModelOptionalParams = tllm.
-        TrtGptModelOptionalParams()
+        stats_queue_addr: Tuple[str, int, bytes],
+        executor_config: tllm.ExecutorConfig = tllm.ExecutorConfig(1)
     ) -> None:
         result_queue = None
 
@@ -671,6 +672,7 @@ class ExecutorBindingsProxy(GenerationExecutor):
             request_queue = Fifo(request_queue_addr, is_server=False)
             request_id_queue = Fifo(request_id_queue_addr, is_server=False)
             result_queue = Fifo(result_queue_addr, is_server=False)
+            mp_stats_queue = Fifo(stats_queue_addr, is_server=False)
 
         # Only the failure on rank0 can be captured here. All the non-rank0 process will hang once the executor runtime
         # is successfully initialized, that is controlled within cpp runtime.
@@ -678,13 +680,10 @@ class ExecutorBindingsProxy(GenerationExecutor):
         # TODO[chunweiy]: fix the non-rank0 process failure
         init_ok = True
         try:
-            executor = ExecutorBindingsWorker(engine_dir, tokenizer,
-                                              max_beam_width, executor_type,
-                                              scheduler_config, executor_config)
+            executor = ExecutorBindingsWorker(engine_dir, executor_config)
         except Exception as e:
             init_ok = False
             raise e
-
         finally:
             if mpi_rank() == 0:
                 result_queue.put(init_ok)
@@ -692,11 +691,13 @@ class ExecutorBindingsProxy(GenerationExecutor):
         with ContextManager(executor) as executor:
             if mpi_rank() == 0:
                 executor.set_result_queue(result_queue)
+                executor.set_stats_queue(mp_stats_queue)
                 while (req := request_queue.get()) is not None:
                     result = executor.submit(req)
-                    request_id_queue.put(result.generation_request.id)
+                    request_id_queue.put(result.request_id)
 
                 result_queue.put(None)
+                mp_stats_queue.put(None)
             else:
                 executor.block_subordinates()
 
@@ -705,26 +706,44 @@ class ExecutorBindingsProxy(GenerationExecutor):
             correct GenerationResult queues. """
 
         while (res := self.result_queue.get()) is not None:
-            req_id = res[0]
+            req_id, *_ = res
+            # Wait for this result ready in self._results
+            while req_id not in self._results or self._request_id_dispatcher_queue.full(
+            ):
+                self._request_id_dispatcher_queue.get()
             self._results[req_id].queue.put(res)
+
+    def stats_main(self):
+        while (stats := self.mp_stats_queue.get()) is not None:
+            time.sleep(0.1)
+            while self.stats_queue.full():
+                self.stats_queue.get()
+            self.stats_queue.put(stats)
 
     def start(self):
         self.mpi_futures = self.mpi_session.submit(
             ExecutorBindingsProxy.workers_main, **self.workers_kwargs)
         self.workers_started = True
-        ack = self.result_queue.get()
-        if not ack:
+        self.workers_init_ok = self.result_queue.get()
+        if not self.workers_init_ok:
             raise RuntimeError("worker initialization failed")
         self.dispatcher.start()
+        self.create_stats_queue()
+        self.stats_thread.start()
 
     def shutdown(self):
         if not self.workers_started:
             return
-        self.request_queue.put(None)
+        if self.workers_init_ok:
+            self.request_queue.put(None)
         for f in self.mpi_futures:
             f.result()
         if self.dispatcher.is_alive():
+            self.result_queue.put(None)
             self.dispatcher.join()
+        if self.stats_thread.is_alive():
+            self.mp_stats_queue.put(None)
+            self.stats_thread.join()
         self.workers_started = False
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -735,30 +754,17 @@ class ExecutorBindingsProxy(GenerationExecutor):
         if not self.workers_started:
             self.start()
 
-        tokenizer = request.tokenizer
-        # no need to send the tokenizer to the executor,
-        # saves communication time
-        request.tokenizer = None
-
         self.request_queue.put(request)
 
         # Await req id.
         req_id = self.request_id_queue.get()
         request.set_id(req_id)
 
-        result = GenerationResult(request, tokenizer)
+        result = GenerationResult(request)
         self._results[req_id] = result
-        request.tokenizer = tokenizer
+        self._request_id_dispatcher_queue.put(req_id)
 
         return result
-
-    def get_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
-
-    async def aget_stats(self):
-        # TODO: https://jirasw.nvidia.com/browse/TRTLLM-514
-        pass
 
     def __del__(self):
         self.shutdown()

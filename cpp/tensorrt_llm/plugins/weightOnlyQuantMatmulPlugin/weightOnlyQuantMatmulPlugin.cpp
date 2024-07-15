@@ -16,6 +16,8 @@
  */
 #include "weightOnlyQuantMatmulPlugin.h"
 
+#include <numeric>
+
 using namespace nvinfer1;
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::kernels::cutlass_kernels;
@@ -297,6 +299,9 @@ int WeightOnlyQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc const* input
     int const m = TLLM_INT32_CAST(m64);
     int const n = TLLM_INT32_CAST(inputDesc[1].dims.d[1]);
     int const k = TLLM_INT32_CAST(inputDesc[0].dims.d[inputDesc[0].dims.nbDims - 1]);
+
+    if (m == 0)
+        return 0;
 
     bool const use_cuda_kernel = m < SMALL_M_FAST_PATH && mCudaKernelEnabled;
 #if defined(ENABLE_BF16)

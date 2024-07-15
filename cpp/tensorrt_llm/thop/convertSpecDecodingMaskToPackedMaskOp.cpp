@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/convertSpecDecodingMaskToPackedMask.h"
+#include "tensorrt_llm/kernels/speculativeDecoding/explicitDraftTokensKernels.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 namespace th = torch;
@@ -49,10 +49,10 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
 
     int batchSize = specDecodingGenerationLengthsTensor.size(0);
 
-    int64_t scanTempMemoryBytes
-        = tensorrt_llm::kernels::invokeScanSpecDecodingGenerationLenghtsTempStorageBytes(batchSize, stream);
-    int64_t reduceMaxTempMemoryBytes
-        = tensorrt_llm::kernels::invokeReduceMaxSpecDecodingGenerationLengthsTempStorageBytes(batchSize, stream);
+    int64_t scanTempMemoryBytes = tensorrt_llm::kernels::speculative_decoding::invokeScanGenerationLengths(
+        nullptr, 0, nullptr, nullptr, batchSize, stream);
+    int64_t reduceMaxTempMemoryBytes = tensorrt_llm::kernels::speculative_decoding::invokeReduceMaxGenerationLengths(
+        nullptr, 0, nullptr, nullptr, batchSize, stream);
 
     torch::Tensor scanTempMemoryStorage = torch::empty(
         {
@@ -75,7 +75,7 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
         },
         torch::dtype(torch::kInt).device(torch::kCUDA).requires_grad(false));
 
-    tensorrt_llm::kernels::invokeScanSpecDecodingGenerationLenghths(batchSize,
+    tensorrt_llm::kernels::speculative_decoding::invokeScanReduceGenerationLengths(batchSize,
         specDecodingGenerationLengthsTensor.data_ptr<int>(),
         reinterpret_cast<void*>(scanTempMemoryStorage.data_ptr<int8_t>()), scanTempMemoryBytes,
         scanedSpecDecodingGenerationLengths.data_ptr<int>(),
@@ -85,10 +85,10 @@ void convertSpecDecodingMaskToPackedMask(torch::Tensor specDecodingGenerationLen
     int hostMaxSpecDecodingGenerationLengths;
     cudaMemcpyAsync(&hostMaxSpecDecodingGenerationLengths, maxSpecDecodingGenerationLengths.data_ptr<int>(),
         sizeof(int), cudaMemcpyDeviceToHost, stream);
-    tensorrt_llm::kernels::invokeConvertSpecDecodingMaskToPackedMask(batchSize,
-        scanedSpecDecodingGenerationLengths.data_ptr<int>(), specDecodingMaskTensor.data_ptr<bool>(),
-        maxSpecDecodingTokens, hostMaxSpecDecodingGenerationLengths, specDecodingPackedMaskTensor.data_ptr<int>(),
-        stream);
+    tensorrt_llm::kernels::speculative_decoding::invokeConvertMaskToPackedMask(batchSize,
+        scanedSpecDecodingGenerationLengths.data_ptr<int>(), maxSpecDecodingGenerationLengths.data_ptr<int>(),
+        specDecodingMaskTensor.data_ptr<bool>(), nullptr, maxSpecDecodingTokens, maxSpecDecodingTokens + 1,
+        specDecodingPackedMaskTensor.data_ptr<int>(), stream);
 }
 
 } // namespace torch_ext

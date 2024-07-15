@@ -86,7 +86,7 @@ trtllm-build --checkpoint_dir ./trt_ckpt/gptj_fp16_tp1/ \
              --gemm_plugin float16 \
              --max_batch_size=32 \
              --max_input_len=1919 \
-             --max_output_len=128 \
+             --max_seq_len=2047 \
              --strip_plan
 ```
 
@@ -211,7 +211,6 @@ python ../quantization/quantize.py --model_dir /llm-models/llama-models-v2/llama
 trtllm-build --checkpoint_dir ./llama2-70b-hf-fp8-tp2 \
                 --output_dir engines/llama2-70b-hf-fp8-tp2 \
                 --gemm_plugin float16 \
-                --strongly_typed \
                 --workers 2
 ```
 
