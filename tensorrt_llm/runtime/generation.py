@@ -3157,8 +3157,8 @@ class GenerationSession(object):
                 host_context_lengths, attention_mask, cross_attention_mask,
                 prompt_vocab_size, ite, sequence_limit_lengths,
                 sequence_lengths, next_step_tensors, stop_words_data,
-                bad_words_data, no_repeat_ngram_size, encoder_outputs,
-                encoder_input_lengths, stopping_criteria, logits_processor, update,
+                bad_words_data, encoder_outputs, encoder_input_lengths,
+                stopping_criteria, logits_processor, update,
                 **kwargs)
             if step == 0:
                 if benchmark_profiler is not None:
