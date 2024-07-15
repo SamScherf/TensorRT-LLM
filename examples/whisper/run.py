@@ -168,21 +168,26 @@ class WhisperDecoding:
                  encoder_outputs,
                  eot_id,
                  max_new_tokens=40,
-                 num_beams=1):
+                 num_beams=1,
+                 batch_size=None):
+
+        if batch_size == None:
+            batch_size = encoder_outputs.shape[0]
+
         encoder_input_lengths = torch.tensor(
-            [encoder_outputs.shape[1] for x in range(encoder_outputs.shape[0])],
+            [encoder_outputs.shape[1] for x in range(batch_size)],
             dtype=torch.int32,
             device='cuda')
         decoder_input_lengths = torch.tensor([
             decoder_input_ids.shape[-1]
-            for _ in range(decoder_input_ids.shape[0])
+            for _ in range(batch_size)
         ],
                                              dtype=torch.int32,
                                              device='cuda')
         decoder_max_input_length = torch.max(decoder_input_lengths).item()
 
         cross_attention_mask = torch.ones(
-            [encoder_outputs.shape[0], 1,
+            [batch_size, 1,
              encoder_outputs.shape[1]]).int().cuda()
 
         # generation config
@@ -190,7 +195,7 @@ class WhisperDecoding:
                                          pad_id=eot_id,
                                          num_beams=num_beams)
         self.decoder_generation_session.setup(
-            decoder_input_lengths.size(0),
+            batch_size,
             decoder_max_input_length,
             max_new_tokens,
             beam_width=num_beams,
@@ -199,19 +204,21 @@ class WhisperDecoding:
         torch.cuda.synchronize()
 
         decoder_input_ids = decoder_input_ids.type(torch.int32).cuda()
-        output_ids = self.decoder_generation_session.decode(
+        output_ids_dict = self.decoder_generation_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
             sampling_config,
             encoder_output=encoder_outputs,
             encoder_input_lengths=encoder_input_lengths,
             cross_attention_mask=cross_attention_mask,
+            batch_size=batch_size,
         )
         torch.cuda.synchronize()
 
         # get the list of int from output_ids tensor
-        output_ids = output_ids.cpu().numpy().tolist()
-        return output_ids
+        for key in output_ids_dict.keys():
+            output_ids_dict[key] = output_ids_dict[key].cpu().numpy().tolist()
+        return output_ids_dict
 
 
 class WhisperTRTLLM(object):
@@ -248,23 +255,39 @@ class WhisperTRTLLM(object):
             mel,
             text_prefix="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
             num_beams=1):
+
+        encoder_output = self.encoder.get_audio_features(mel)
+        return self.process_encoder_output(encoder_output)
+
+    def process_encoder_output(
+            self,
+            encoder_output,
+            text_prefix="<|startoftranscript|><|en|><|transcribe|><|notimestamps|>",
+            num_beams=1,
+            batch_size=None
+            ):
+
+        if batch_size == None:
+            batch_size = encoder_output.shape[0]
+
         prompt_id = self.tokenizer.encode(
             text_prefix, allowed_special=self.tokenizer.special_tokens_set)
         prompt_id = torch.tensor(prompt_id)
-        batch_size = mel.shape[0]
-        decoder_input_ids = prompt_id.repeat(batch_size, 1)
 
-        encoder_output = self.encoder.get_audio_features(mel)
-        output_ids = self.decoder.generate(decoder_input_ids,
+        decoder_input_ids = prompt_id.repeat(encoder_output.shape[0], 1)
+
+        output_ids_dict = self.decoder.generate(decoder_input_ids,
                                            encoder_output,
                                            self.eot_id,
-                                           max_new_tokens=96,
-                                           num_beams=num_beams)
-        texts = []
-        for i in range(len(output_ids)):
-            text = self.tokenizer.decode(output_ids[i][0]).strip()
-            texts.append(text)
-        return texts
+                                           max_new_tokens=10000,
+                                           num_beams=num_beams,
+                                           batch_size=batch_size)
+        texts_dict = dict()
+        for key in output_ids_dict.keys():
+            text = self.tokenizer.decode(output_ids_dict[key][0]).strip()
+            texts_dict[key] = text
+
+        return texts_dict
 
 
 def decode_wav_file(
@@ -323,16 +346,21 @@ def decode_dataset(
         sample_rate=16000,
         mel_filters_dir=None):
     librispeech_dummy = load_dataset(dataset, "clean", split="validation")
-
+    
+    max_encoder_batch_size = 8  # Unsure why this is
     data_loader = DataLoader(librispeech_dummy,
-                             batch_size=batch_size,
+                             batch_size=max_encoder_batch_size,
                              num_workers=4,
                              pin_memory=True,
                              collate_fn=collate_wrapper)
-    results = []
+
+    # Loop through the all batches and run the encoder on each wav file
     total_duration = 0
+    labels = list()
+    wav_ids = list()
+    encoder_outputs = list()
     for batch in data_loader:
-        waveforms, durations, texts, ids = batch
+        waveforms, durations, batch_texts, batch_ids = batch
         total_duration += sum(durations) / sample_rate
 
         for wave in waveforms:
@@ -346,14 +374,34 @@ def decode_dataset(
             for wave in waveforms
         ]
         features = torch.cat(features, dim=0).type(str_dtype_to_torch(dtype))
-        predictions = model.process_batch(features, text_prefix, num_beams)
-        for wav_id, label, prediction in zip(ids, texts, predictions):
-            # remove all special tokens in the prediction
-            prediction = re.sub(r'<\|.*?\|>', '', prediction)
-            if normalizer:
-                prediction, label = normalizer(prediction), normalizer(label)
-            print(f"wav_id: {wav_id}, label: {label}, prediction: {prediction}")
-            results.append((wav_id, label.split(), prediction.split()))
+
+        batch_encoder_output = model.encoder.get_audio_features(features)
+
+        wav_ids += batch_ids
+        labels += batch_texts
+        encoder_outputs.append(batch_encoder_output)
+
+    # Recast encoder outputs to be a tensor
+    encoder_outputs = torch.cat(encoder_outputs, dim=0)
+
+    # Process all the encoder outputs
+    predictions_dict = model.process_encoder_output(encoder_outputs, text_prefix=text_prefix,
+                                                    num_beams=num_beams, batch_size=batch_size)
+
+    # Loop through the predictions
+    results = list()
+    for index in predictions_dict.keys():
+        wav_id = wav_ids[index]
+        label = labels[index]
+        prediction = predictions_dict[index]
+
+        # remove all special tokens in the prediction
+        prediction = re.sub(r'<\|.*?\|>', '', prediction)
+        if normalizer:
+            prediction, label = normalizer(prediction), normalizer(label)
+        print(f"wav_id: {wav_id},\n label     : {label}, \n prediction: {prediction}")
+        results.append((wav_id, label.split(), prediction.split()))
+    print("Number of seqs: " + str(len(predictions_dict.keys())))
     return results, total_duration
 
 

@@ -261,17 +261,22 @@ void FtDynamicDecode<T>::forward(th::Tensor const& logits, int const step, int c
 
     mDynamicDecodeLayer->forwardAsync(outputParams, forwardParams);
 
-    if (finishedSumHost)
+    // I've replaced should_stop bool with a 1d tensor of bools. The value
+    // of the bool indicates if the sequence on the decoder with the bool's
+    // index has finished or not. This needs to be cleaned up
+    if (finished_sum_host)
     {
-        TLLM_CUDA_CHECK(::cudaStreamSynchronize(mDynamicDecodeLayer->getStream()));
-        int32_t numRealFinished = 0;
-        for (int32_t bi = 0; bi < localBatchSize; ++bi)
+        TLLM_CUDA_CHECK(::cudaStreamSynchronize(dynamic_decode_layer_->getStream()));
+        // int32_t numRealFinished = 0;
+        auto should_stop_accessor = should_stop.accessor<bool, 1>();
+        for (int32_t bi = 0; bi < local_batch_size; ++bi)
         {
-            numRealFinished += finishedSumHost[bi];
+            // numRealFinished += finished_sum_host[bi];
+            should_stop_accessor[bi] = finished_sum_host[bi] == 1;
         }
-        auto const numToFinish = outputParams->finished->size();
-        auto shouldStopAccessor = shouldStop.accessor<bool, 1>();
-        shouldStopAccessor[0] = numToFinish == numRealFinished;
+        // auto const numToFinish = outputParams->finished->size();
+        // auto should_stop_accessor = should_stop.accessor<bool, 1>();
+        // should_stop_accessor[0] = numToFinish == numRealFinished;
     }
 }
 
@@ -401,18 +406,19 @@ th::Tensor DynamicDecodeOp::forward(
     CHECK_OPTIONAL_INPUT(srcCacheIndirectionOpt, torch::kInt32);
     CHECK_INPUT(outputTokenIds, torch::kInt32);
     CHECK_INPUT(newTokens, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(finishedInput, torch::kUInt8);
-    CHECK_OPTIONAL_INPUT(finishedOutput, torch::kUInt8);
-    CHECK_OPTIONAL_INPUT(sequenceLengthsOpt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(cumLogProbsOpt, torch::kFloat32);
-    CHECK_OPTIONAL_INPUT(outputLogProbsOpt, torch::kFloat32);
-    CHECK_OPTIONAL_INPUT(outputLogProbsTiledOpt, torch::kFloat32);
-    CHECK_OPTIONAL_INPUT(parentIdsOpt, torch::kInt32);
-    CHECK_OPTIONAL_INPUT(tgtCacheIndirectionOpt, torch::kInt32);
+    CHECK_OPTIONAL_INPUT(finished_input, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(finished_output, torch::kUInt8);
+    CHECK_OPTIONAL_INPUT(sequence_lengths_opt, torch::kInt32);
+    CHECK_OPTIONAL_INPUT(cum_log_probs_opt, torch::kFloat32);
+    CHECK_OPTIONAL_INPUT(output_log_probs_opt, torch::kFloat32);
+    CHECK_OPTIONAL_INPUT(output_log_probs_tiled_opt, torch::kFloat32);
+    CHECK_OPTIONAL_INPUT(parent_ids_opt, torch::kInt32);
+    CHECK_OPTIONAL_INPUT(tgt_cache_indirection_opt, torch::kInt32);
 
-    th::Tensor shouldStop = torch::zeros({1}, torch::dtype(torch::kBool).requires_grad(false));
+    th::Tensor should_stop = torch::zeros({local_batch_size}, torch::dtype(torch::kBool).requires_grad(false));
 
-    dynamicDecode_->forward(
+    dynamic_decode_->forward(
+
         // Inputs
         logits, static_cast<int>(step), static_cast<int>(maxInputLength), static_cast<int>(maxAttentionWindow),
         static_cast<int>(sinkTokenLength), static_cast<uint32_t>(ite), static_cast<int>(localBatchSize), endId,
