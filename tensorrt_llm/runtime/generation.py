@@ -3144,10 +3144,6 @@ class GenerationSession(object):
 
         # Being stepping
         for step in range(0, self.max_new_tokens):
-            # Tmp start timer
-            import time
-            start = time.time()
-
             seqs_status, next_step_tensors, tasks, context_lengths, host_context_lengths, attention_mask, context_logits, generation_logits, encoder_input_lengths = self.handle_per_step(
                 cache_indirections, step, batch_size, max_context_length,
                 beam_width, input_ids, hidden_states, scfg,
@@ -3176,113 +3172,35 @@ class GenerationSession(object):
                 update = False
 
             # Check if any seqs are done
-            if seqs_status is not None:
-                for i in range(seqs_status.shape[0]):
-                    if seqs_status[i] and not seq_queue.empty():
-                        # Get output ids
-                        final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
+            for i in range(seqs_status.shape[0]):
+                if seqs_status[i] and not seq_queue.empty():
+                    # Get output ids
+                    final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
 
-                        # Save finished sequence
-                        results[mapping[i]] = final_output_ids[i]
+                    # Save finished sequence
+                    results[mapping[i]] = final_output_ids[i]
 
-                        # Pop next seq off queue
-                        key, encoder_output, input_id = seq_queue.get()
+                    # Pop next seq off queue
+                    key, encoder_output, input_id = seq_queue.get()
 
-                        # Put new sequence on gpu
-                        encoder_outputs[i] = encoder_output
-                        input_ids[i] = input_id
+                    # Put new sequence on the decoder tensors
+                    encoder_outputs[i] = encoder_output
+                    input_ids[i] = input_id
 
-                        # Update mapping
-                        mapping[i] = key
+                    # Update mapping
+                    mapping[i] = key
 
-                        # I'm unsure why exactly all of the rest of the code under this section
-                        # is required. I believe it has something to do with "updating" the encoder
-                        # to use the newly set encoder_outputs and input_ids. I suspect lots
-                        # of unnecessarily overhead is coming from this section
-                        # -----------------------------------------------------------------------
+                    # Set update flag
+                    update = True
 
-                        if step % 2:
-                            context = self.runtime.context_0
-                            this_src_cache_indirection = cache_indirections[1]
-                            this_tgt_cache_indirection = cache_indirections[0]
-                            next_src_cache_indirection = cache_indirections[0]
-                        else:
-                            context = self.runtime.context_1
-                            this_src_cache_indirection = cache_indirections[0]
-                            this_tgt_cache_indirection = cache_indirections[1]
-                            next_src_cache_indirection = cache_indirections[1]
+            # Check if update was made
+            if update:
+                self.__setup_decoder(input_ids, scfg, host_context_lengths, batch_size)
+                continue
 
-                        ctx_tensors = {}
-
-                        def sym(x, name):
-                            return RuntimeTensor.from_torch(name, x)
-
-                        def add_tensor(x, name):
-                            return ctx_tensors.update({name: sym(x, name)})
-
-                        add_tensor(encoder_outputs, 'encoder_output')
-
-                        if self.mapping.has_pp():
-                            hidden_size = self.hidden_size * self.mapping.tp_size
-                            if input_ids.dim() == 2:
-                                hidden_states_input = hidden_states_input.resize_(
-                                    batch_size, input_ids.shape[1], hidden_size)
-                            else:
-                                hidden_states_input = hidden_states_input.resize_(
-                                    batch_size, hidden_size)
-
-                        if self.mapping.is_last_pp_rank():
-                            add_tensor(self.buffer['logits'], 'logits')
-                        else:
-                            add_tensor(hidden_states_input, 'hidden_states_output')
-                        
-                        if self.mapping.is_first_pp_rank():
-                            add_tensor(input_ids, 'input_ids')
-                        else:
-                            add_tensor(hidden_states_input, 'hidden_states_input')
-
-                        batch_size = context_lengths.shape[0]
-                        if not self.paged_kv_cache:
-                            for idx in range(self.first_layer, self.last_layer):
-                                if self.layer_types[idx] == 'attention':
-                                    key_value_cache = self.buffer[f'present_key_value_{idx}']
-                                    # when plugin is used, past_ket_value tensor does not need to be empty tensor
-                                    # because plugin does not care, and does not use this shape.
-                                    add_tensor(key_value_cache, f'past_key_value_{idx}')
-                                    add_tensor(key_value_cache, f'present_key_value_{idx}')
-
-                                    if self.cross_attention:
-                                        cross_cache_buffer = self.buffer[
-                                            f'cross_present_key_value_{idx}']
-                                        add_tensor(cross_cache_buffer,
-                                                   f'cross_past_key_value_{idx}')
-                                        add_tensor(cross_cache_buffer,
-                                                   f'cross_present_key_value_{idx}')
-
-                        context = self.runtime.ctx_context
-                        self.runtime._set_tensors(context, ctx_tensors)
-                        # -----------------------------------------------------------------------
-
-                        update = True
-
-                if update:
-                    # Set up decoder again
-                    self.__setup_decoder(input_ids, scfg, host_context_lengths, batch_size)
-                    continue
-
-                # Check if all seqs are done
-                for i in range(seqs_status.shape[0]):
-                    if not seqs_status[i]:
-                        break
-
-                    if seq_queue.empty():
-                        final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
-                        for i in range(batch_size):
-                            results[mapping[i]] = final_output_ids[i]
-                        return results
-
-            if step == self.max_new_tokens-1:
-
+            # Check if all seqs are done or max token limit is hit
+            finished = all(seq_status for seq_status in seqs_status) and seq_queue.empty()
+            if finished or step == self.max_new_tokens-1:
                 # Get output ids
                 final_output_ids = self.finalize_decoder(context_lengths, batch_size, beam_width, scfg)
 

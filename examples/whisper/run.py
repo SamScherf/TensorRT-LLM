@@ -204,7 +204,7 @@ class WhisperDecoding:
         torch.cuda.synchronize()
 
         decoder_input_ids = decoder_input_ids.type(torch.int32).cuda()
-        output_ids_dict = self.decoder_generation_session.decode(
+        output_ids = self.decoder_generation_session.decode(
             decoder_input_ids,
             decoder_input_lengths,
             sampling_config,
@@ -216,9 +216,9 @@ class WhisperDecoding:
         torch.cuda.synchronize()
 
         # get the list of int from output_ids tensor
-        for key in output_ids_dict.keys():
-            output_ids_dict[key] = output_ids_dict[key].cpu().numpy().tolist()
-        return output_ids_dict
+        for key in output_ids.keys():
+            output_ids[key] = output_ids[key].cpu().numpy().tolist()
+        return output_ids
 
 
 class WhisperTRTLLM(object):
